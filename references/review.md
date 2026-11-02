@@ -17,7 +17,7 @@ A deliberately balanced sample is not a population-weighted defect estimate. Use
 complete conversations for email review and treat conversations, not mailbox copies,
 as independent units for uncertainty estimates.
 
-The v1 scorer has six fixed dimensions. A dimension that cannot be assessed is null
+The v2 scorer has six fixed dimensions. A dimension that cannot be assessed is null
 with a reason; the scorer does not redistribute its weight. Adapt the applicable checks
 within a dimension to the document type. A reference manual does not need an invoice
 number, and an acknowledgment does not need an attachment.
@@ -36,7 +36,7 @@ number, and an acknowledgment does not need an attachment.
 Keep originals unchanged during OCR/conversion. Record conversion tools and versions,
 input and output hashes, and whether rendered or extracted text was reviewed. The
 bundled scanner does not perform OCR, render pages, recalculate spreadsheets, inspect
-digital signatures, or validate every Office relationship. Those remain explicit review
+digital signatures, or establish business meaning from Office relationships. Those remain explicit review
 work, not implied passes. CAD, video, and other unsupported file families are outside
 the scanner's documentary scope and are counted as excluded by extension.
 
@@ -81,7 +81,7 @@ and `NOT_CHECKED` for missing execution or evidence. Each contextual finding nee
 code, severity, evidence path/hash/locator, observed fact, expected behavior, and next
 action. Record valid controls for broad pattern findings.
 
-Review every mechanical finding and retain it with a disposition. Any confirmed
+Review every mechanical finding and retain it with a disposition. A confirmed
 defect blocks acceptance. Unresolved defects or review clues mean `needs_review`.
 Incomplete measurement or sampled context means `partial`, even if the observed score
 is high. `pass_within_scope` requires complete measurement and full reviewed coverage
@@ -97,8 +97,10 @@ tune thresholds against the same collection until it gets the desired score.
 ## Task mining and material points
 
 Enumerate concrete opportunities, not generic tasks inferred from filenames. A candidate
-becomes validated only after a reviewer verifies its required evidence, demonstrates a
-feasible solution or output, and records an acceptance result. Use a reviewer/model
+becomes validated only after a reviewer verifies its inspected input evidence,
+references a demonstrated output separately in `validation.output_evidence`, and
+records an acceptance result. The output must be present in the measured evidence
+snapshot, and cannot overlap task inputs. Use a reviewer/model
 separate from the proposer when independent checking is available and authorized; the
 skill does not require delegation for ordinary measurement.
 
@@ -107,9 +109,9 @@ timeline reconstruction, artifact creation/revision, or workflow follow-through.
 Give each instance a stable `dedupe_key` covering the business case, requested outcome,
 and evidence version. Same case/output with reworded instructions counts once, including
 copies found in several mailboxes. Distinct cases with the same template can be separate
-instances but remain one task family. The script rejects repeated keys and identical
-validated instances under different keys or copied evidence paths. The reviewer must
-still examine paraphrased and semantically overlapping tasks.
+instances but remain one task family. The script also deduplicates same-family tasks by canonical input units, independent
+of wording and keys. Review semantic duplicates across different representations
+that cannot be established from bytes or MIME content alone.
 
 Use these provisional depth weights:
 
@@ -118,7 +120,10 @@ Use these provisional depth weights:
 - **3 points:** a multi-step decision or artifact/workflow change with dependencies and a
   substantive acceptance check. Length, page count, and file count alone do not increase depth.
 
-`material_points` is the sum of weights for unique validated instances. Report candidate
+`material_points` is the sum of independent validated material depths, recorded in
+`review.material.items`; it is not calculated from task instances. Use each canonical
+evidence unit once across material items. A material item records a key, summary,
+usability reason, depth, status and evidence. Task depth remains descriptive only. Report candidate
 count, validated count, family diversity, and counts by depth separately. A capped or
 sampled search supplies an observed lower bound, not an exhaustive corpus total. No
 reviewed candidates is a measured zero only when the planned search actually completed.
@@ -129,3 +134,18 @@ deliverables, and answer-bearing evidence from task inputs when reconstructing w
 could be done at a historical point; keep such records in separate evaluator evidence.
 Open-ended drafting tasks need a factual and purpose-specific rubric, not exact string
 matching. Do not count unsupported or unsolvable tasks merely because they sound useful.
+
+## Structured unit coverage
+
+Every rated or validated evidence reference includes a `mode` and `units` object,
+for example `{"mode":"visual","units":{"kind":"page","ranges":[[1,4]]}}`.
+Use the scanner's `metrics.review_units` bounds and labels. A filename list or a
+free-text locator cannot establish full page/part coverage. Presentation review of
+PDFs, Office and HTML requires visual mode for each claimed unit. The grader checks
+coverage claims, not whether the reviewer actually performed or understood them.
+
+Historical task cutoffs and input availability must be timezone-aware. A later
+native email date cannot be replaced by an earlier reviewer assertion. Unknown
+availability remains unverified. Later outputs may support validation only, with
+separate evidence references. Retain provisional weights and unscored lanes; do not
+convert an unfinished empty search into a measured zero.

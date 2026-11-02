@@ -13,8 +13,8 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 REPORTS = {
     "measure": {"measurement.json", "inventory.jsonl", "findings.jsonl", "artifact_mining.json",
-                "artifact_collections.csv", "score-summary.csv", "measurement.log"},
-    "grade": {"grade.json", "review.json", "artifact_mining.json", "score-summary.csv"},
+                "artifact_collections.csv", "score-summary.csv", "evidence_links.jsonl", "measurement.log"},
+    "grade": {"grade.json", "review.json", "artifact_mining.json", "artifact_material.json", "score-summary.csv"},
 }
 
 
@@ -124,7 +124,8 @@ def validate_measurement(directory):
         raise ValueError("duplicate inventory paths")
     if measurement["coverage"]["files_discovered"] != len(records):
         raise ValueError("inventory count does not match measured coverage")
-    for name, field in (("inventory.jsonl", "inventory_sha256"), ("findings.jsonl", "findings_sha256")):
+    for name, field in (("inventory.jsonl", "inventory_sha256"), ("findings.jsonl", "findings_sha256"),
+                        ("evidence_links.jsonl", "links_sha256")):
         if receipt["reports"][name] != measurement.get(field):
             raise ValueError("measurement does not bind " + name)
     return measurement, receipt, records, findings

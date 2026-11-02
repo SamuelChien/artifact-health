@@ -38,11 +38,14 @@ class WorkflowTests(unittest.TestCase):
         health.prepare_review(run, plan, per_stratum=3)
         review = read_object(plan / "review.json")
         _, _, records, _ = validate_measurement(run)
-        evidence = [{"path": r["path"], "sha256": r["sha256"], "locator": "all fixture content"} for r in records]
+        evidence = [{"path": r["path"], "sha256": r["sha256"], "locator": "all fixture content", "mode": "visual",
+                     "units": {"kind": r["metrics"].get("review_units", {}).get("kind", "file"),
+                               "ranges": [[1, r["metrics"].get("review_units", {}).get("count", 1)]]}} for r in records]
         review["reviewer"] = {"kind": "agent", "name": "fixture reviewer", "model": "fixture-model"}
         for dimension in review["dimensions"].values():
             dimension.update(rating=4, scope="full", reviewed_paths=[r["path"] for r in records], evidence=copy.deepcopy(evidence), reason="Reviewed synthetic fixture only.")
         review["mining"] = {"status": "complete", "search_scope": "All fixture files; bounded fixture-only search.", "tasks": []}
+        review["material"] = {"status": "complete", "search_scope": "All fixture files; fixture-only material review.", "items": []}
         scanner.write_json(plan / "review.json", review)
         result = health.grader.grade(run, plan / "review.json", self.base / name)
         return result, plan / "review.json", self.base / name
@@ -56,6 +59,57 @@ class WorkflowTests(unittest.TestCase):
         result = health.read_artifact_health(self.run, grade_dir)
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["tasks"]["validated_task_count"], 0)
+
+    def test_full_health_requires_independent_material_assessment(self):
+        self.scan()
+        _, review_path, _ = self.reviewed()
+        review = read_object(review_path)
+        review["material"] = {"status": "not_run", "search_scope": "", "items": []}
+        scanner.write_json(review_path, review)
+        destination = self.base / "without-material"
+        health.grader.grade(self.run, review_path, destination)
+        self.assertEqual(health.read_artifact_health(self.run, destination, require="quality")["status"], "passed")
+        result = health.read_artifact_health(self.run, destination)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("material_assessment", {issue["check"] for issue in result["issues"]})
+
+    def test_parallel_parser_retains_deterministic_evidence_and_copy_cache(self):
+        for number in range(12):
+            (self.source / f"copy-{number}.txt").write_text("Shared fixture")
+        (self.source / "empty.txt").write_bytes(b"")
+        (self.source / "native.pages").mkdir()
+        first, _ = self.scan()
+        second_path = self.base / "parallel"
+        second, _ = scanner.measure(self.source, second_path, workers=4)
+        for name in ("inventory.jsonl", "findings.jsonl", "evidence_links.jsonl"):
+            self.assertEqual((self.run / name).read_bytes(), (second_path / name).read_bytes())
+        self.assertEqual(first["coverage"]["parser_cache_hits"], 11)
+        self.assertEqual(second["coverage"]["parser_cache_hits"], 11)
+        self.assertEqual(first["source_fingerprint"], second["source_fingerprint"])
+
+    def test_review_queue_samples_distinct_content_before_copies(self):
+        for number in range(12):
+            (self.source / f"copy-{number}.txt").write_text("Shared fixture")
+        (self.source / "third.txt").write_text("Third distinct fixture")
+        self.scan()
+        health.prepare_review(self.run, self.base / "unique-plan", per_stratum=3)
+        plan = read_object(self.base / "unique-plan/plan.json")
+        self.assertEqual(len(plan["queue"]), 3)
+        self.assertEqual(len({row["sha256"] for row in plan["queue"]}), 3)
+        self.assertEqual(plan["strata"][0]["eligible_content_groups"], 3)
+
+    def test_material_comparison_has_its_own_search_scope(self):
+        self.scan()
+        _, review_path, before_grade = self.reviewed()
+        review = read_object(review_path)
+        review["material"]["search_scope"] = "Different material search"
+        scanner.write_json(review_path, review)
+        after_grade = self.base / "different-material"
+        health.grader.grade(self.run, review_path, after_grade)
+        result = health.compare_runs(self.run, self.run, before_grade, after_grade)
+        self.assertTrue(result["tasks"]["protocol_matched"])
+        self.assertFalse(result["material"]["protocol_matched"])
+        self.assertIsNone(result["material"]["descriptive_deltas"]["material_points"]["delta"])
 
     def test_defects_take_precedence_over_incomplete_scan(self):
         (self.source / "empty.txt").write_bytes(b"")
@@ -193,14 +247,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(json.loads(stream.getvalue())["status"], "error")
 
     def test_duplicate_task_under_new_key_cannot_inflate_material(self):
+        (self.source / "answer.txt").write_text("Fixture output")
         self.scan()
         _, review_path, _ = self.reviewed()
         review = read_object(review_path)
         task = {"dedupe_key": "case-one", "family": "extract_and_structure", "depth": 1,
                 "status": "validated", "summary": "Extract fixture text", "expected_output": "Fixture text row",
                 "acceptance_criteria": "Text agrees with the cited fixture", "temporal_cutoff": None,
-                "evidence": review["dimensions"]["integrity"]["evidence"],
-                "validation": {"passed": True, "reviewer": "fixture", "method": "fixture assertion", "result": "Fixture matched"}}
+                "evidence": [e for e in review["dimensions"]["integrity"]["evidence"] if e["path"] == "record.txt"],
+                "validation": {"passed": True, "reviewer": "fixture", "method": "fixture assertion", "result": "Fixture matched",
+                               "output_evidence": [e for e in review["dimensions"]["integrity"]["evidence"] if e["path"] == "answer.txt"]}}
         repeated = copy.deepcopy(task)
         repeated["dedupe_key"] = "different-key-same-task"
         review["mining"]["tasks"] = [task, repeated]
@@ -220,17 +276,18 @@ class WorkflowTests(unittest.TestCase):
         health.prepare_review(self.run, plan)
         review = read_object(plan / "review.json")
         _, _, rows, _ = validate_measurement(self.run)
-        evidence = [{"path": row["path"], "sha256": row["sha256"], "locator": "fixture page 1", **({"pages": [1]} if row["extension"] == ".pdf" else {})} for row in rows]
+        evidence = [{"path": row["path"], "sha256": row["sha256"], "locator": "fixture page 1", "mode": "visual",
+                     "units": {"kind": row["metrics"]["review_units"]["kind"], "ranges": [[1, 1]]}} for row in rows]
         review["reviewer"] = {"kind": "agent", "name": "fixture", "model": "fixture"}
         for dimension in review["dimensions"].values():
             dimension.update(rating=4, scope="full", reviewed_paths=[r["path"] for r in rows], evidence=copy.deepcopy(evidence))
         scanner.write_json(plan / "review.json", review)
-        with self.assertRaisesRegex(ValueError, "every pages unit"):
+        with self.assertRaisesRegex(ValueError, "every measured page or part"):
             health.grader.grade(self.run, plan / "review.json", self.base / "invalid-pages")
         for dimension in review["dimensions"].values():
             for item in dimension["evidence"]:
                 if item["path"].endswith(".pdf"):
-                    item["pages"] = [1, 2]
+                    item["units"]["ranges"] = [[1, 2]]
         scanner.write_json(plan / "review.json", review)
         result = health.grader.grade(self.run, plan / "review.json", self.base / "all-pages")
         self.assertEqual(result["factors"]["integrity"]["units_reviewed"]["pages"], 2)
@@ -247,6 +304,38 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["quality"]["descriptive_deltas"]["integrity"]["delta"], 0)
         self.assertFalse(result["quality"]["score_comparable"])
         self.assertTrue(result["tasks"]["protocol_matched"])
+
+    def test_batch_scorecard_reads_grade_outside_measurement_bundle(self):
+        from scripts.batch import measure_folders, refresh_batch
+        batch = self.base / "batch"
+        result = measure_folders(self.base, batch, ["source"], workers=2)
+        self.assertEqual(result["status"], "incomplete")
+        run = batch / "source"
+        health.prepare_review(run, self.base / "batch-review")
+        review_path = self.base / "batch-review/review.json"
+        review = read_object(review_path)
+        _, _, records, _ = validate_measurement(run)
+        row = records[0]
+        evidence = [{"path": row["path"], "sha256": row["sha256"], "locator": "whole fixture", "mode": "text",
+                     "units": {"kind": "file", "ranges": [[1, 1]]}}]
+        review["reviewer"] = {"kind": "human", "name": "fixture only"}
+        for dimension in review["dimensions"].values():
+            dimension.update(rating=4, scope="full", reviewed_paths=[row["path"]], evidence=evidence, reason="Fixture only")
+        scanner.write_json(review_path, review)
+        health.grader.grade(run, review_path, batch / "grades/source")
+        self.assertEqual(refresh_batch(batch)["scored_folders"], 1)
+        summary = read_object(batch / "score-summary.json")["folders"][0]
+        self.assertEqual(summary["score_scope"], "full")
+        self.assertEqual(summary["artifact_health_score"], 100)
+        self.assertIsNone(summary["material_points"])
+
+    def test_batch_cli_emits_one_json_result(self):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            code = health.main(["batch", str(self.base), "--out", str(self.base / "batch-json"),
+                                "--folders", "source", "--workers", "2"])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stream.getvalue())["folders"], 1)
 
     def test_grade_cli_returns_failure_for_observed_defect(self):
         self.scan()

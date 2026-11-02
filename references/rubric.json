@@ -1,5 +1,5 @@
 {
-  "version": "artifact-health-v1",
+  "version": "artifact-health-v2",
   "calibration_status": "provisional",
   "dimensions": {
     "integrity": {"weight": 15, "label": "Technical integrity"},
@@ -17,6 +17,7 @@
     "4": "Meets the dimension's requirements throughout the stated reviewed scope."
   },
   "task_depth_weights": {"1": 1.0, "2": 2.0, "3": 3.0},
+  "material_depth_weights": {"1": 1.0, "2": 2.0, "3": 3.0},
   "task_families": [
     "extract_and_structure", "reconcile_and_audit", "compare_and_decide",
     "reconstruct_timeline", "create_or_revise", "workflow_followthrough"

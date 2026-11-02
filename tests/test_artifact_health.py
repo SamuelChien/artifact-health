@@ -33,9 +33,11 @@ class ArtifactHealthTests(unittest.TestCase):
         measurement = json.loads((self.run / "measurement.json").read_text())
         receipt = json.loads((self.run / "run.json").read_text())
         inventory = load_lines(self.run / "inventory.jsonl")
-        evidence = [{"path": row["path"], "sha256": row["sha256"], "locator": "all fixture content"} for row in inventory]
+        evidence = [{"path": row["path"], "sha256": row["sha256"], "locator": "all fixture content", "mode": "visual",
+                     "units": {"kind": row["metrics"].get("review_units", {}).get("kind", "file"),
+                               "ranges": [[1, row["metrics"].get("review_units", {}).get("count", 1)]]}} for row in inventory]
         dimensions = json.loads(RUBRIC_PATH.read_text())["dimensions"]
-        return {"rubric_version": "artifact-health-v1", "source_fingerprint": measurement["source_fingerprint"],
+        return {"rubric_version": json.loads(RUBRIC_PATH.read_text())["version"], "source_fingerprint": measurement["source_fingerprint"],
                 "inventory_sha256": measurement["inventory_sha256"],
                 "measurement_run_id": receipt["run_id"], "measurement_sha256": receipt["reports"]["measurement.json"],
                 "findings_sha256": measurement["findings_sha256"],
@@ -195,14 +197,21 @@ class ArtifactHealthTests(unittest.TestCase):
             self.apply_review(review)
 
     def test_task_validation_and_duplicate_rejection(self):
+        (self.source / "answer.txt").write_text("Computed fixture row: 2, 10, 20")
         self.seed_clean()
         review = self.clean_review()
+        evidence = review["dimensions"]["integrity"]["evidence"]
+        inputs = [item for item in evidence if item["path"] == "record.txt"]
+        outputs = [item for item in evidence if item["path"] == "answer.txt"]
         task = {"dedupe_key": "fixture:extract:v1", "family": "extract_and_structure", "depth": 1,
                 "status": "validated", "summary": "Extract the fixture quantity and price.",
-                "evidence": copy.deepcopy(review["dimensions"]["integrity"]["evidence"]),
+                "evidence": copy.deepcopy(inputs),
                 "expected_output": "A fixture row", "acceptance_criteria": "Quantity 2, price 10, total 20.",
-                "temporal_cutoff": None, "validation": {"passed": True, "reviewer": "fixture checker", "method": "fixture assertions", "result": "Fixture values agree."}}
+                "temporal_cutoff": None, "validation": {"passed": True, "reviewer": "fixture checker", "method": "fixture assertions", "result": "Fixture values agree.", "output_evidence": outputs}}
         review["mining"] = {"status": "complete", "search_scope": "One synthetic fixture case.", "tasks": [task]}
+        review["material"] = {"status": "complete", "search_scope": "Fixture source only.", "items": [
+            {"dedupe_key": "fixture", "summary": "Quantity and price record", "reason": "Values checked in the fixture.",
+             "status": "validated", "depth": 1, "evidence": inputs}]}
         result = self.apply_review(review, "valid-mining")
         self.assertEqual(result["material_points"], 1)
         self.assertEqual(result["validated_task_count"], 1)

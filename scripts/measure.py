@@ -6,10 +6,12 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from collections import Counter, defaultdict
@@ -18,14 +20,19 @@ from email import policy
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree as ET
 
 if __package__:
     from .evidence import digest_file, write_json, evaluator_identity, run_receipt, source_fingerprint
+    from .relations import analyze
+    from .workers import ParserWorkers
 else:
     from evidence import digest_file, write_json, evaluator_identity, run_receipt, source_fingerprint
+    from relations import analyze
+    from workers import ParserWorkers
 
-VERSION = "artifact-health-measure@2"
+VERSION = "artifact-health-measure@3"
 RUBRIC_PATH = Path(__file__).resolve().parents[1] / "references/rubric.json"
 EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".eml", ".txt", ".md",
               ".csv", ".tsv", ".json", ".html", ".htm", ".doc", ".xls", ".ppt",
@@ -85,6 +92,7 @@ def probe(path):
                 note("PDF_ENCRYPTED", "PDF needs a password; page content was not inspected.", "NOT_CHECKED", "info")
                 return result
             metrics["pages"] = len(reader.pages)
+            metrics["review_units"] = {"kind": "page", "count": metrics["pages"]}
             lengths = [len((page.extract_text() or "").strip()) for page in reader.pages]
             metrics["native_text_characters"] = sum(lengths)
             metrics["pages_without_native_text"] = sum(length == 0 for length in lengths)
@@ -101,21 +109,52 @@ def probe(path):
                 main = {".docx": "word/document.xml", ".xlsx": "xl/workbook.xml",
                         ".pptx": "ppt/presentation.xml", ".odt": "content.xml"}[ext]
                 names = set(archive.namelist())
+                if len(names) != len(archive.namelist()):
+                    note("OFFICE_DUPLICATE_PART", "Package contains duplicate member names.", "DEFECT", "major")
+                if archive.testzip() is not None:
+                    note("OFFICE_CRC_FAILED", "A package member failed its checksum.", "DEFECT", "major")
+                external = 0
+                for rel_name in sorted(n for n in names if n.endswith(".rels")):
+                    relationships = ET.fromstring(archive.read(rel_name))
+                    base = posixpath.dirname(posixpath.dirname(rel_name))
+                    for relationship in relationships:
+                        if relationship.get("TargetMode") == "External":
+                            external += 1
+                            continue
+                        target = unquote(urlsplit(relationship.get("Target", "")).path)
+                        resolved = posixpath.normpath(target.lstrip("/") if target.startswith("/") else posixpath.join(base, target))
+                        if not target or resolved == ".." or resolved.startswith("../") or resolved not in names:
+                            note("OFFICE_RELATIONSHIP_MISSING", "Internal package relationship has no available target: " + rel_name,
+                                 "DEFECT", "major")
                 if ext != ".odt":
                     ET.fromstring(archive.read("[Content_Types].xml"))
                 selected = [main]
                 if ext == ".xlsx":
                     selected += sorted(n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
+                    if "xl/sharedStrings.xml" in names:
+                        selected.append("xl/sharedStrings.xml")
                 elif ext == ".pptx":
                     selected += sorted(n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n))
                 text_chars = 0
                 formula_count = 0
+                errors = uncached = 0
                 for name in selected:
                     document = ET.fromstring(archive.read(name))
                     text_chars += sum(len(node.text or "") for node in document.iter() if node.tag.rsplit("}", 1)[-1] in {"t", "p", "span"})
                     formula_count += sum(node.tag.rsplit("}", 1)[-1] == "f" for node in document.iter())
+                    if ext == ".xlsx":
+                        for node in document.iter():
+                            if node.tag.rsplit("}", 1)[-1] == "c":
+                                children = {child.tag.rsplit("}", 1)[-1]: child for child in node}
+                                errors += node.get("t") == "e"
+                                uncached += "f" in children and ("v" not in children or not children["v"].text)
                 metrics.update(xml_parts_inspected=len(selected), native_text_characters=text_chars,
-                               formula_cells=formula_count, package_members=len(names))
+                               formula_cells=formula_count, package_members=len(names), external_relationships=external,
+                               review_units={"kind": "part", "count": len(selected), "labels": selected})
+                if ext == ".xlsx":
+                    metrics.update(cached_error_cells=errors, formula_cells_without_cached_values=uncached)
+                    if errors or uncached:
+                        note("SPREADSHEET_CALCULATION_REVIEW", "Cached errors or missing formula values require recalculation and review.")
                 if ext == ".pptx":
                     metrics["slides"] = len(selected) - 1
         elif ext == ".eml":
@@ -124,25 +163,37 @@ def probe(path):
                 note("EMAIL_NO_HEADERS", "No recognizable mail headers were found.", "DEFECT", "major")
             metrics["message_id"] = str(message.get("Message-ID", "")).strip() or None
             metrics["in_reply_to"] = str(message.get("In-Reply-To", "")).strip() or None
+            metrics["reply_ids"] = re.findall(r"<[^<>\s]+>", metrics["in_reply_to"] or "")
             metrics["references"] = re.findall(r"<[^<>\s]+>", str(message.get("References", "")))
             try:
                 date = parsedate_to_datetime(str(message.get("Date", "")))
                 metrics["date_has_timezone"] = date.tzinfo is not None
                 metrics["date_utc"] = date.astimezone(timezone.utc).isoformat() if date.tzinfo else None
+                if date.tzinfo is None:
+                    note("EMAIL_DATE_TIMEZONE_UNKNOWN", "Native Date has no timezone; chronology requires additional evidence.")
             except (ValueError, TypeError, OverflowError):
                 metrics["date_utc"] = None
                 note("EMAIL_DATE_UNKNOWN", "No usable native Date header; chronology requires other evidence.")
             attachments = []
             text_chars = 0
             defects = []
+            content_parts = []
+            leaf_number = 0
             for part in message.walk():
                 if part.is_multipart():
                     defects.extend(type(d).__name__ for d in part.defects)
+                    if part.get_content_disposition() == "attachment":
+                        note("NESTED_MESSAGE_ATTACHMENT_UNCHECKED", "Attached multipart message requires separate content inspection.", "NOT_CHECKED", "info")
                     continue
+                leaf_number += 1
                 payload = part.get_payload(decode=True) or b""
+                content_parts.append([part.get_content_type(), part.get_content_charset(), part.get_content_disposition(),
+                                      part.get_filename(), str(part.get("Content-ID", "")),
+                                      hashlib.sha256(payload.replace(b"\r\n", b"\n") if part.get_content_maintype() == "text" else payload).hexdigest()])
                 defects.extend(type(d).__name__ for d in part.defects)
                 if part.get_filename() or part.get_content_disposition() == "attachment":
                     attachments.append({"name": part.get_filename(), "content_type": part.get_content_type(),
+                                        "part": leaf_number,
                                         "disposition": part.get_content_disposition(), "bytes": len(payload),
                                         "sha256": hashlib.sha256(payload).hexdigest()})
                 elif part.get_content_maintype() == "text":
@@ -151,7 +202,9 @@ def probe(path):
                     except (UnicodeError, LookupError):
                         note("EMAIL_CHARSET_REVIEW", "A text part could not be decoded with its declared/default charset.")
             metrics.update(named_or_attachment_parts=attachments, body_characters_including_quotes=text_chars,
-                           mime_defects=sorted(set(defects)))
+                           mime_defects=sorted(set(defects)), review_units={"kind": "part", "count": leaf_number})
+            authored_headers = [str(message.get(name, "")) for name in ("From", "To", "Cc", "Subject", "Date", "In-Reply-To", "References")]
+            metrics["content_sha256"] = hashlib.sha256(json.dumps([authored_headers, content_parts], ensure_ascii=False).encode()).hexdigest()
             if defects:
                 note("EMAIL_MIME_DEFECTS", ", ".join(sorted(set(defects))), "REVIEW", "major")
         else:
@@ -164,11 +217,12 @@ def probe(path):
                 note("TEXT_ENCODING_UNKNOWN", "Not UTF-8 or BOM-marked UTF-16; select the actual encoding before grading.", "NOT_CHECKED", "info")
                 return result
             metrics["text_characters"] = len(text)
+            metrics["review_units"] = {"kind": "file", "count": 1}
             if ext == ".json":
                 data = json.loads(text)
                 if path.name == "index.json" and isinstance(data, dict) and isinstance(data.get("messages"), list):
                     rows = data["messages"]
-                    if any(isinstance(row, dict) and ("eml_file" in row or "text_file" in row) for row in rows):
+                    if any(isinstance(row, dict) and any(key in row for key in ("eml_file", "text_file", "original_file")) for row in rows):
                         result["index"] = {"path_base": data.get("path_base", "."), "rows": [
                             {k: row.get(k) for k in ("eml_file", "original_file", "text_file", "sha256", "original_sha256", "text_sha256")}
                             if isinstance(row, dict) else None for row in rows]}
@@ -222,6 +276,11 @@ def discover_files(root, scope, deadline=float("inf")):
                 excluded["symlink_directories"] += 1
             elif name in scope["skip_directory_names"] or explicit_exclusion(relative):
                 excluded["excluded_directories"] += 1
+            elif path.suffix.lower() in {".pages", ".numbers", ".key"}:
+                if profile == "email":
+                    excluded["profile:" + path.suffix.lower()] += 1
+                else:
+                    files.append((relative, path))
             else:
                 retained.append(name)
         dirs[:] = retained
@@ -258,7 +317,7 @@ def snapshot_file(path, destination, deadline):
 
 
 def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_timeout=30,
-            max_files=None, max_file_mb=100):
+            max_files=None, max_file_mb=100, workers=1):
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise ValueError("source must be a directory")
@@ -266,6 +325,8 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
         raise ValueError("unknown measurement profile")
     if any(not math.isfinite(value) or value <= 0 for value in (budget_seconds, file_timeout, max_file_mb)) or (max_files is not None and max_files < 1):
         raise ValueError("budgets, file limits, and timeouts must be positive")
+    if type(workers) is not int or not 1 <= workers <= 32:
+        raise ValueError("workers must be an integer from 1 to 32")
     exclusions = []
     for item in exclude:
         value = Path(item)
@@ -276,15 +337,17 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
     scope = {"profile": profile, "exclude": sorted(set(exclusions)), "skip_directory_names": sorted(SKIP_DIRS),
              "extensions": sorted(EXTENSIONS), "selection_version": 2}
     with run_receipt(out, "measure", source_root=str(root)) as receipt:
-        result, code = _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file_mb, receipt["run_id"])
+        result, code = _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file_mb, receipt["run_id"], workers)
         receipt.update(source_fingerprint=result["source_fingerprint"], measurement_status=result["status"], exit_code=code)
     return result, code
 
 
-def _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file_mb, run_id):
+def _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file_mb, run_id, workers=1):
     started = time.monotonic()
     deadline = started + budget_seconds
     records, findings, indexes = [], [], []
+    inspection_cache, cache_hits = {}, 0
+    cache_locks = [threading.Lock() for _ in range(max(1, workers * 4))]
 
     def progress(phase, **details):
         with (out / "measurement.log").open("a", encoding="utf-8") as log:
@@ -300,60 +363,104 @@ def _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file
     progress("discovery_finished", files=len(files), complete=discovery_complete)
     for error in discovery_errors:
         finding("DISCOVERY_INCOMPLETE", ".", error)
-    for number, (relative, path) in enumerate(files):
-        if number % 100 == 0:
-            progress("inspection", completed=number, total=len(files))
+    pool = ParserWorkers(workers, out)
+    def inspect_one(item):
+        number, (relative, path) = item
         parts = Path(relative).parts
         record = {"path": relative, "collection": parts[0] if len(parts) > 1 else ".",
                   "extension": path.suffix.lower(), "bytes": None, "sha256": None,
                   "status": "unavailable", "metrics": {}}
-        records.append(record)
+        notes = []
+        index = None
+        def finding(code, path, detail, kind="NOT_CHECKED", severity="info", sha256=None):
+            notes.append({"kind": kind, "severity": severity, "code": code, "path": path, "sha256": sha256, "detail": detail})
         try:
             if not path.resolve().is_relative_to(root) or path.is_symlink():
                 finding("SOURCE_PATH_CHANGED", relative, "Selected path now resolves outside the source or to a symlink.")
-                continue
+                return record, notes, index
             before = path.stat()
+            if path.is_dir():
+                record["kind"] = "package_directory"
+                finding("PACKAGE_DIRECTORY_UNAVAILABLE", relative, "Document bundle is inventoried; a bundle-aware converter is required.")
+                return record, notes, index
             record["bytes"] = before.st_size
             if max_files is not None and number >= max_files:
                 finding("FILE_COUNT_LIMIT", relative, "Outside the configured inspection count.")
-                continue
+                return record, notes, index
             if before.st_size > max_file_mb * 1024 * 1024:
                 finding("FILE_SIZE_LIMIT", relative, "Exceeds the configured file size limit.")
-                continue
+                return record, notes, index
             if before.st_size == 0:
                 record["sha256"] = digest_file(path, deadline)
                 record["status"] = "invalid"
                 finding("EMPTY_FILE", relative, "File has zero bytes.", "DEFECT", "major", record["sha256"])
-                continue
+                return record, notes, index
             with tempfile.TemporaryDirectory(prefix=".probe-", dir=out) as temporary:
                 snapshot = Path(temporary) / path.name
                 record["sha256"] = snapshot_file(path, snapshot, deadline)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("run budget exhausted")
-                child_env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SYSTEMROOT") if name in os.environ}
-                child = subprocess.run([sys.executable, "-E", "-B", str(Path(__file__).resolve()), "--probe-file", str(snapshot)],
-                                       capture_output=True, text=True, encoding="utf-8", cwd=temporary, env=child_env,
-                                       timeout=min(file_timeout, remaining))
-            if child.returncode != 0:
-                progress("parser_process_failed", path=relative, returncode=child.returncode, stderr_tail=child.stderr[-2000:])
-                finding("PARSER_PROCESS_FAILED", relative, "Inspection process did not return a result.", sha256=record["sha256"])
-                continue
-            result = json.loads(child.stdout)
+                cache_key = (record["extension"], path.name if record["extension"] == ".json" else "", record["sha256"])
+                # Serialize copies of the same content while allowing unrelated files
+                # to parse concurrently. Every copy is still independently hashed.
+                lock = cache_locks[int(record["sha256"][:8], 16) % len(cache_locks)]
+                with lock:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("run budget exhausted waiting for parser")
+                    if cache_key in inspection_cache:
+                        result = inspection_cache[cache_key]
+                        record["_cache_hit"] = True
+                    else:
+                        if workers > 1:
+                            result = pool.query(snapshot, min(file_timeout, remaining))
+                        else:
+                            child_env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SYSTEMROOT") if name in os.environ}
+                            child = subprocess.run([sys.executable, "-E", "-B", str(Path(__file__).resolve()), "--probe-file", str(snapshot)],
+                                                   capture_output=True, text=True, encoding="utf-8", cwd=temporary, env=child_env,
+                                                   timeout=min(file_timeout, remaining))
+                            if child.returncode != 0:
+                                progress("parser_process_failed", path=relative, returncode=child.returncode, stderr_tail=child.stderr[-2000:])
+                                finding("PARSER_PROCESS_FAILED", relative, "Inspection process did not return a result.", sha256=record["sha256"])
+                                return record, notes, index
+                            result = json.loads(child.stdout)
+                        if result["status"] in {"inspected", "invalid"}:
+                            inspection_cache[cache_key] = result
             after = path.stat()
             if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
                 record["status"] = "changed"
                 finding("SOURCE_CHANGED", relative, "Source changed during inspection; rerun on a stable snapshot.", sha256=record["sha256"])
-                continue
+                return record, notes, index
             record.update(status=result["status"], metrics=result["metrics"])
             for note in result["observations"]:
                 finding(path=relative, sha256=record["sha256"], **note)
             if "index" in result:
-                indexes.append((relative, result["index"]))
+                index = (relative, result["index"])
         except (TimeoutError, subprocess.TimeoutExpired):
             finding("INSPECTION_TIMEOUT", relative, "Run budget or per-file timeout prevented inspection.", sha256=record["sha256"])
         except (OSError, ValueError) as exc:
             finding("INSPECTION_UNAVAILABLE", relative, type(exc).__name__, sha256=record["sha256"])
+
+        return record, notes, index
+
+    try:
+        results = pool.map(inspect_one, enumerate(files)) if workers > 1 else map(inspect_one, enumerate(files))
+        for completed, (record, notes, index) in enumerate(results, 1):
+            cache_hits += int(record.pop("_cache_hit", False))
+            records.append(record)
+            findings.extend(notes)
+            if index is not None:
+                indexes.append(index)
+            if completed % 100 == 0:
+                progress("inspection", completed=completed, total=len(files))
+    finally:
+        pool.close()
+    records.sort(key=lambda row: row["path"])
+    findings.sort(key=lambda row: (row["path"], row["code"], row["detail"]))
+    for number, item in enumerate(findings, 1):
+        item["id"] = f"F{number:06d}"
+    indexes.sort(key=lambda item: item[0])
 
     by_path = {record["path"]: record for record in records}
     progress("inspection_finished", files=len(records))
@@ -401,6 +508,10 @@ def _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file
                 else:
                     index_stats["hashes_matched"] += 1
 
+    email_metrics, links = analyze(records, finding)
+    with (out / "evidence_links.jsonl").open("w", encoding="utf-8") as stream:
+        for link in links:
+            stream.write(json.dumps(link, ensure_ascii=False) + "\n")
     if not records:
         finding("EMPTY_SCOPE", ".", "No documentary files were discovered in the selected scope.")
     status_counts = Counter(record["status"] for record in records)
@@ -433,15 +544,17 @@ def _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file
                    "measured_at": datetime.now(timezone.utc).isoformat(), "source_name": root.name, "source_root": str(root),
                    "source_fingerprint": fingerprint, "inventory_sha256": digest_file(out / "inventory.jsonl"),
                    "findings_sha256": digest_file(out / "findings.jsonl"),
+                    "links_sha256": digest_file(out / "evidence_links.jsonl"),
                    "status": "partial" if incomplete else "complete", "scope": scope,
-                   "limits": {"budget_seconds": budget_seconds, "file_timeout": file_timeout, "max_files": max_files, "max_file_mb": max_file_mb},
+                   "limits": {"budget_seconds": budget_seconds, "file_timeout": file_timeout, "max_files": max_files, "max_file_mb": max_file_mb, "workers": workers},
                    "coverage": {"discovery_complete": discovery_complete, "files_discovered": len(records),
-                                "files_hashed": sum(hash_counts.values()), "status_counts": dict(status_counts), "excluded": dict(excluded),
+                                "files_hashed": sum(hash_counts.values()), "parser_cache_hits": cache_hits,
+                                "status_counts": dict(status_counts), "excluded": dict(excluded),
                                 "by_extension": {ext: dict(counts) for ext, counts in sorted(by_extension.items())}},
                    "metrics": {"unique_file_hashes": len(hash_counts), "exact_duplicate_copies": sum(hash_counts.values()) - len(hash_counts),
                                "eml_files": len(message_ids), "distinct_rfc_message_ids": len({value for value in message_ids if value}),
                                "eml_without_measured_id": sum(not value for value in message_ids)},
-                   "email_indexes": dict(index_stats), "collections": collections,
+                    "email_indexes": dict(index_stats), "email_continuity": email_metrics, "collections": collections,
                    "finding_counts": dict(Counter(f["kind"] for f in findings)),
                    "limitations": ["No visual, OCR, business-state, authorship, or semantic review was performed.",
                                     "Email index hashes do not establish raw/text semantic agreement.",
@@ -462,6 +575,10 @@ def _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--probe-stream":
+        for request in sys.stdin:
+            print(json.dumps(probe(json.loads(request)), ensure_ascii=False), flush=True)
+        return 0
     if len(sys.argv) == 3 and sys.argv[1] == "--probe-file":
         print(json.dumps(probe(sys.argv[2]), ensure_ascii=False))
         return 0
@@ -472,6 +589,7 @@ def main():
     parser.add_argument("--exclude", action="append", default=[])
     parser.add_argument("--budget-seconds", type=float, default=900)
     parser.add_argument("--file-timeout", type=float, default=30)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--max-files", type=int)
     parser.add_argument("--max-file-mb", type=float, default=100)
     args = parser.parse_args()

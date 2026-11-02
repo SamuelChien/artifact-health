@@ -11,9 +11,11 @@ from pathlib import Path
 if __package__:
     from .measure import RUBRIC_PATH, digest_file, new_output, write_csv, write_json
     from .evidence import load_lines, validate_measurement, run_receipt, evaluator_identity
+    from .review_rules import coverage, unit_spec, canonical_units, overlaps, check_cutoff, timestamp
 else:
     from measure import RUBRIC_PATH, digest_file, new_output, write_csv, write_json
     from evidence import load_lines, validate_measurement, run_receipt, evaluator_identity
+    from review_rules import coverage, unit_spec, canonical_units, overlaps, check_cutoff, timestamp
 
 
 def require(condition, message):
@@ -79,6 +81,7 @@ def grade(run, review, out):
         require(len(set(paths)) == len(paths) and set(paths) <= set(by_path), "invalid or duplicate reviewed paths")
         referenced = evidence_paths(dimension.get("evidence"), required=rating is not None)
         require(set(paths) == referenced, "reviewed_paths must exactly match the evidence paths")
+        covered = coverage(dimension["evidence"], by_path)
         if rating is None:
             require(scope == "not_checked", "missing rating requires not_checked scope")
             all_scored = False
@@ -87,30 +90,27 @@ def grade(run, review, out):
             observed += definition["weight"] * rating / 4
         if scope == "full":
             require(set(paths) == set(by_path), "full scope must cover every inventory path")
-        units_reviewed = Counter()
-        units_eligible = Counter()
-        for path in paths:
-            row = by_path[path]
-            unit = "pages" if row["extension"] == ".pdf" else "slides" if row["extension"] == ".pptx" else None
-            expected_units = row["metrics"].get(unit) if unit else None
-            if type(expected_units) is not int:
-                continue
-            covered = set()
-            for item in dimension["evidence"]:
-                if item["path"] != path:
-                    continue
-                values = item.get(unit, [])
-                require(isinstance(values, list) and all(type(value) is int and 1 <= value <= expected_units for value in values), "invalid " + unit + " coverage for " + path)
-                covered.update(values)
-            units_reviewed[unit] += len(covered)
-            units_eligible[unit] += expected_units
-            if scope == "full":
-                require(len(covered) == expected_units, "full review needs explicit coverage of every " + unit + " unit in " + path)
-        if scope != "full":
+            require(all(covered.get(path) == [[1, unit_spec(row)["count"]]] for path, row in by_path.items()),
+                    "full scope must cover every measured page or part, not just every filename")
+        else:
             all_full = False
+        if name == "communication" and rating is not None:
+            visual = coverage(dimension["evidence"], by_path, visual_only=True)
+            for path in paths:
+                if by_path[path]["extension"] in {".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".html", ".htm"}:
+                    require(visual.get(path) == covered[path], "presentation ratings need visual evidence for the reviewed units")
         factors[name] = {"rating": rating, "score": None if rating is None else rating * 25,
                          "weight": definition["weight"], "scope": scope, "files_reviewed": len(paths),
-                         "units_reviewed": dict(units_reviewed), "units_eligible_in_reviewed_files": dict(units_eligible)}
+                         "unit_coverage": {path: {"kind": unit_spec(by_path[path])["kind"],
+                              "reviewed": sum(end - start + 1 for start, end in spans),
+                              "eligible": unit_spec(by_path[path])["count"], "ranges": spans}
+                              for path, spans in covered.items()}}
+        reviewed_counts, eligible_counts = Counter(), Counter()
+        for path, spans in covered.items():
+            spec = unit_spec(by_path[path])
+            reviewed_counts[spec["kind"] + "s"] += sum(end - start + 1 for start, end in spans)
+            eligible_counts[spec["kind"] + "s"] += spec["count"]
+        factors[name].update(units_reviewed=dict(reviewed_counts), units_eligible_in_reviewed_files=dict(eligible_counts))
 
     dispositions = review.get("dispositions", [])
     require(isinstance(dispositions, list), "dispositions must be a list")
@@ -143,6 +143,43 @@ def grade(run, review, out):
     grade_status = ("fail" if confirmed_defect else "needs_review" if unresolved or undisposed else
                     "partial" if not full else "pass_within_scope")
 
+    blocked = set()
+    for finding, disposition in adjudicated:
+        if (finding["kind"] == "NOT_CHECKED" and disposition != "explained"
+                or finding["kind"] == "DEFECT" and finding["severity"] in {"major", "critical"}):
+            if "path" in finding:
+                blocked.add(finding["path"])
+            else:
+                blocked.update(e["path"] for e in finding["evidence"])
+
+    material = review.get("material", {"status": "not_run", "search_scope": "", "items": []})
+    require(isinstance(material, dict) and material.get("status") in {"not_run", "partial", "complete"}, "invalid material assessment status")
+    items = material.get("items")
+    require(isinstance(items, list), "material items must be a list")
+    require(material["status"] != "not_run" or not items, "not_run material assessment cannot include items")
+    require(material["status"] == "not_run" or nonempty(material.get("search_scope")), "material assessment needs its search scope")
+    material_keys, material_units, usable_items = set(), [], []
+    for item in items:
+        require(isinstance(item, dict), "material item must be an object")
+        require(all(nonempty(item.get(field)) for field in ("dedupe_key", "summary", "reason")), "material item needs a key, summary and usability reason")
+        require(item["dedupe_key"] not in material_keys, "duplicate material key")
+        material_keys.add(item["dedupe_key"])
+        require(item.get("status") in {"candidate", "validated"}, "invalid material item status")
+        require(type(item.get("depth")) is int and str(item["depth"]) in rubric["material_depth_weights"], "invalid material depth")
+        evidence_paths(item.get("evidence"), required=item["status"] == "validated")
+        if item["status"] == "validated":
+            units = canonical_units(item["evidence"], by_path, blocked=blocked)
+            require(not any(overlaps(units, previous) for previous in material_units), "material evidence overlaps an already counted item or copy")
+            material_units.append(units)
+            usable_items.append(item)
+    material_ran = material["status"] == "complete" or bool(usable_items)
+    material_result = {"status": material["status"], "search_scope": material.get("search_scope", ""),
+                       "exhaustive": False, "basis": "distinct reviewed evidence units",
+                       "material_points": sum(rubric["material_depth_weights"][str(item["depth"])] for item in usable_items) if material_ran else None,
+                       "validated_material_count": len(usable_items) if material_ran else None,
+                       "candidate_material_count": len(items) - len(usable_items)
+                           if material["status"] == "complete" or len(items) > len(usable_items) else None, "items": items}
+
     mining = review.get("mining", {"status": "not_run", "search_scope": "", "tasks": []})
     require(isinstance(mining, dict) and mining.get("status") in {"not_run", "partial", "complete"}, "invalid mining status")
     tasks = mining.get("tasks")
@@ -163,27 +200,31 @@ def grade(run, review, out):
         require(task.get("status") in {"candidate", "validated"}, "invalid task status")
         cutoff = task.get("temporal_cutoff")
         if cutoff is not None:
-            require(nonempty(cutoff), "invalid temporal cutoff")
-            datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+            timestamp(cutoff)
         evidence_paths(task.get("evidence"), required=task["status"] == "validated")
         if task["status"] == "validated":
-            instance = [task["family"], " ".join(task["summary"].lower().split()),
-                        " ".join(task["expected_output"].lower().split()), cutoff,
-                        sorted({(e["sha256"], e["locator"]) for e in task["evidence"]})]
+            units = canonical_units(task["evidence"], by_path, blocked=blocked)
+            instance = [task["family"], units]
             instance_digest = hashlib.sha256(json.dumps(instance, sort_keys=True).encode()).hexdigest()
             require(instance_digest not in instance_fingerprints, "duplicate validated instance under different keys or copied paths")
             instance_fingerprints.add(instance_digest)
+            check_cutoff(task["evidence"], by_path, cutoff)
         if task["status"] == "validated":
             validation = task.get("validation")
             require(isinstance(validation, dict) and validation.get("passed") is True and
                     all(nonempty(validation.get(field)) for field in ("reviewer", "result", "method")), "validated task needs a passed, documented validation")
+            evidence_paths(validation.get("output_evidence"))
+            output_units = canonical_units(validation["output_evidence"], by_path, blocked=blocked)
+            require(not overlaps(units, output_units), "task inputs overlap the demonstrated output; separate answer evidence from inputs")
             validated.append(task)
         else:
             candidates.append(task)
-    ran = mining["status"] != "not_run"
+    ran = mining["status"] == "complete" or bool(validated)
     mining_result = {"status": mining["status"], "search_scope": mining.get("search_scope", ""), "exhaustive": False,
-                     "material_points": sum(rubric["task_depth_weights"][str(t["depth"])] for t in validated) if ran else None,
-                     "validated_task_count": len(validated) if ran else None, "candidate_task_count": len(candidates) if ran else None,
+                     "material_points": material_result["material_points"],
+                     "validation_basis": "reviewer-recorded output evidence and acceptance result",
+                     "validated_task_count": len(validated) if ran else None,
+                     "candidate_task_count": len(candidates) if mining["status"] == "complete" or candidates else None,
                      "validated_by_family": dict(Counter(t["family"] for t in validated)) if ran else None,
                      "validated_by_depth": dict(Counter(t["depth"] for t in validated)) if ran else None, "tasks": tasks}
     result = {"schema_version": 2, "rubric_version": rubric["version"], "calibration_status": rubric["calibration_status"],
@@ -197,6 +238,8 @@ def grade(run, review, out):
               "factors": factors, "observed_quality_score": round(observed, 2) if all_scored else None,
               "quality_score": round(observed, 2) if full else None,
               "material_points": mining_result["material_points"], "validated_task_count": mining_result["validated_task_count"],
+              "validated_material_count": material_result["validated_material_count"],
+              "material_status": material["status"], "mining_status": mining["status"],
               "dispositions": dispositions, "findings": manual,
               "limitations": ["Review evidence is structurally validated; reviewer correctness is not independently proven.",
                                "Rerun measurement to bind this grade to the current source folder.",
@@ -212,6 +255,7 @@ def grade(run, review, out):
         write_json(out / "grade.json", result)
         write_json(out / "review.json", review)
         write_json(out / "artifact_mining.json", mining_result)
+        write_json(out / "artifact_material.json", material_result)
         write_csv(out / "score-summary.csv", [summary], list(summary))
     return result
 

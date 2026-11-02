@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from scripts import measure as scanner
 from scripts import grade as grader
+from scripts.relations import message_key
 from scripts.evidence import (digest_file, evaluator_identity, load_bundle, load_lines,
                               read_object, validate_measurement, write_json)
 
@@ -47,9 +48,12 @@ def _grade_for_measurement(measurement, receipt, grade_directory):
             result.get("inventory_sha256") != measurement["inventory_sha256"]):
         raise ValueError("grade and measurement belong to different runs")
     mining = read_object(Path(grade_directory) / "artifact_mining.json")
+    material = read_object(Path(grade_directory) / "artifact_material.json")
     if any(result.get(key) != mining.get(key) for key in ("material_points", "validated_task_count")):
         raise ValueError("grade and task-mining counts disagree")
-    return result, mining
+    if any(result.get(key) != material.get(key) for key in ("material_points", "validated_material_count")):
+        raise ValueError("grade and independent material assessment disagree")
+    return result, mining, material
 
 
 def read_artifact_health(directory, grade_directory=None, require="full"):
@@ -58,8 +62,9 @@ def read_artifact_health(directory, grade_directory=None, require="full"):
         raise ValueError("require must be mechanical, quality, or full")
     measurement, receipt, _, findings = validate_measurement(directory)
     quality, mining = None, read_object(Path(directory) / "artifact_mining.json")
+    material = {"status": "not_run", "material_points": None, "validated_material_count": None}
     if grade_directory is not None:
-        quality, mining = _grade_for_measurement(measurement, receipt, grade_directory)
+        quality, mining, material = _grade_for_measurement(measurement, receipt, grade_directory)
     issues = []
 
     def issue(check, status, reason, count=None):
@@ -89,6 +94,8 @@ def read_artifact_health(directory, grade_directory=None, require="full"):
             issue("contextual_review", "incomplete", "The contextual review is sampled, incomplete, or has unresolved findings.")
     if require == "full" and mining.get("status") != "complete":
         issue("task_mining", "incomplete", "The declared task-mining search has not completed.")
+    if require == "full" and material.get("status") != "complete":
+        issue("material_assessment", "incomplete", "The independent material assessment has not completed.")
     status = "failed" if any(i["status"] == "failed" for i in issues) else "incomplete" if issues else "passed"
     return {"schema": "artifact-health@2", "status": status, "required_evidence": require, "issues": issues,
             "run_id": receipt["run_id"], "source_fingerprint": measurement["source_fingerprint"],
@@ -96,8 +103,10 @@ def read_artifact_health(directory, grade_directory=None, require="full"):
             "measured_at": measurement["measured_at"], "evaluator": measurement["evaluator"],
             "scope": measurement["scope"], "limits": measurement["limits"], "measurement_status": measurement["status"],
             "coverage": measurement["coverage"], "metrics": measurement["metrics"], "email_indexes": measurement["email_indexes"],
+            "email_continuity": measurement.get("email_continuity"),
             "finding_counts": measurement["finding_counts"], "quality": quality,
             "tasks": {key: mining.get(key) for key in ("status", "search_scope", "material_points", "validated_task_count", "candidate_task_count", "validated_by_family", "validated_by_depth", "exhaustive")},
+            "material": {key: material.get(key) for key in ("status", "search_scope", "material_points", "validated_material_count", "candidate_material_count", "exhaustive")},
             "output_directory": str(Path(directory).resolve())}
 
 
@@ -165,10 +174,16 @@ def prepare_review(directory, output, seed="artifact-health-v2", per_stratum=3):
         strata[(row["collection"], row["extension"])].append(row["path"])
     selected, allocations = set(), []
     for (collection, extension), paths in sorted(strata.items()):
-        ordered = sorted(paths, key=lambda p: hashlib.sha256((seed + "\0" + p).encode()).hexdigest())
-        chosen = ordered[:per_stratum]
+        groups = {}
+        for path in sorted(paths):
+            row = by_path[path]
+            key = message_key(row) if extension == ".eml" and row["status"] == "inspected" else row["sha256"]
+            groups.setdefault(key or path, path)
+        ordered = sorted(groups, key=lambda key: hashlib.sha256((seed + "\0" + key).encode()).hexdigest())
+        chosen = [groups[key] for key in ordered[:per_stratum]]
         selected.update(chosen)
-        allocations.append({"collection": collection, "extension": extension, "eligible_files": len(paths), "selected_files": len(chosen)})
+        allocations.append({"collection": collection, "extension": extension, "eligible_files": len(paths),
+                            "eligible_content_groups": len(groups), "selected_files": len(chosen)})
     representative = set(selected)
     suspicious = {f["path"] for f in findings if f["path"] in by_path}
     selected |= suspicious
@@ -212,9 +227,10 @@ def prepare_review(directory, output, seed="artifact-health-v2", per_stratum=3):
     chosen_components = {find("file:" + path) for path in selected if by_path[path]["extension"] == ".eml"}
     selected |= {r["path"] for r in records if r["extension"] == ".eml" and find("file:" + r["path"]) in chosen_components}
     context = selected - representative - suspicious
-    protocol = {"version": "artifact-health-selection@2", "method": "collection_and_extension_then_email_components",
+    protocol = {"version": "artifact-health-selection@3", "method": "canonical_content_by_collection_and_extension_then_email_components",
                 "seed": seed, "per_stratum": per_stratum, "include_findings": True}
     queue = [{"path": path, "sha256": by_path[path]["sha256"], "status": by_path[path]["status"],
+              "review_units": by_path[path]["metrics"].get("review_units"),
               "reasons": [reason for reason, paths in (("representative", representative), ("finding", suspicious), ("conversation_context", context)) if path in paths]}
              for path in sorted(selected)]
     plan = {"schema": "artifact-health-review-plan@2", "measurement_run_id": receipt["run_id"],
@@ -234,7 +250,8 @@ def prepare_review(directory, output, seed="artifact-health-v2", per_stratum=3):
               "selection": "Reproducible review queue; reading and contextual review have not run.", "selection_protocol": protocol,
               "dimensions": {name: {"rating": None, "scope": "not_checked", "reviewed_paths": [], "evidence": [],
                                     "reason": "Review has not run."} for name in rubric["dimensions"]},
-              "dispositions": [], "findings": [], "mining": {"status": "not_run", "search_scope": "", "tasks": []}}
+              "dispositions": [], "findings": [], "mining": {"status": "not_run", "search_scope": "", "tasks": []},
+              "material": {"status": "not_run", "search_scope": "", "items": []}}
     out = scanner.new_output(output, measurement["source_root"])
     write_json(out / "plan.json", plan)
     write_json(out / "review.json", review)
@@ -276,9 +293,16 @@ def compare_runs(before, after, before_grade=None, after_grade=None):
         task_reasons.append("task searches are incomplete")
     if not left["tasks"].get("search_scope") or left["tasks"].get("search_scope") != right["tasks"].get("search_scope"):
         task_reasons.append("task search scope differs or is absent")
-    tasks = deltas({key: left["tasks"].get(key) for key in ("material_points", "validated_task_count", "candidate_task_count")},
-                   {key: right["tasks"].get(key) for key in ("material_points", "validated_task_count", "candidate_task_count")})
-    for records, blocked in ((metrics, reasons), (quality_deltas, quality_reasons), (tasks, task_reasons)):
+    tasks = deltas({key: left["tasks"].get(key) for key in ("validated_task_count", "candidate_task_count")},
+                   {key: right["tasks"].get(key) for key in ("validated_task_count", "candidate_task_count")})
+    material_reasons = list(quality_reasons)
+    if any(result["material"]["status"] != "complete" for result in (left, right)):
+        material_reasons.append("material assessments are incomplete")
+    if not left["material"].get("search_scope") or left["material"].get("search_scope") != right["material"].get("search_scope"):
+        material_reasons.append("material search scope differs or is absent")
+    material = deltas({key: left["material"].get(key) for key in ("material_points", "validated_material_count")},
+                      {key: right["material"].get(key) for key in ("material_points", "validated_material_count")})
+    for records, blocked in ((metrics, reasons), (quality_deltas, quality_reasons), (tasks, task_reasons), (material, material_reasons)):
         if blocked:
             for row in records.values():
                 row["delta"] = None
@@ -288,6 +312,7 @@ def compare_runs(before, after, before_grade=None, after_grade=None):
             "quality": {"protocol_matched": not quality_reasons, "score_comparable": False,
                         "reasons": quality_reasons, "descriptive_deltas": quality_deltas},
             "tasks": {"protocol_matched": not task_reasons, "reasons": task_reasons, "descriptive_deltas": tasks},
+            "material": {"protocol_matched": not material_reasons, "reasons": material_reasons, "descriptive_deltas": material},
             "limitations": ["Quality weights remain provisional; matching protocol does not establish calibrated ranking validity.",
                             "Declining measurements are retained. Changed collection size and composition still need interpretation."]}
 
@@ -304,7 +329,8 @@ def export_summary(directory, grade_directory=None, output=None):
               "metrics": {key: numeric(health["metrics"].get(key)) for key in ("unique_file_hashes", "exact_duplicate_copies", "eml_files", "distinct_rfc_message_ids")},
               "quality_score": numeric(quality["quality_score"]) if quality else None,
               "factors": {key: numeric(quality["factors"][key]["score"]) if quality else None for key in dimensions},
-              "material_points": numeric(health["tasks"].get("material_points")),
+              "material_points": numeric(health["material"].get("material_points")),
+              "validated_material_count": numeric(health["material"].get("validated_material_count")),
               "validated_task_count": numeric(health["tasks"].get("validated_task_count")),
               "candidate_task_count": numeric(health["tasks"].get("candidate_task_count"))}
     if output is not None:
@@ -330,6 +356,17 @@ def main(argv=None):
     for flag, default in (("budget-seconds", 900), ("file-timeout", 30), ("max-file-mb", 100)):
         measure.add_argument("--" + flag, type=float, default=default)
     measure.add_argument("--max-files", type=int)
+    measure.add_argument("--workers", type=int, default=1)
+    batch = commands.add_parser("batch")
+    batch.add_argument("root")
+    batch.add_argument("--out", dest="output", required=True)
+    batch.add_argument("--folders", nargs="+", required=True)
+    batch.add_argument("--workers", type=int, default=6)
+    batch.add_argument("--budget-seconds", type=float, default=7200)
+    batch.add_argument("--file-timeout", type=float, default=30)
+    batch.add_argument("--max-file-mb", type=float, default=512)
+    refresh = commands.add_parser("batch-refresh")
+    refresh.add_argument("output")
     summary = commands.add_parser("summarize")
     summary.add_argument("directory")
     summary.add_argument("--grade", dest="grade_directory")
@@ -358,8 +395,10 @@ def main(argv=None):
     export.add_argument("--out", dest="output")
     args = vars(parser.parse_args(argv))
     command = args.pop("command")
+    from scripts.batch import measure_folders, refresh_batch
     handlers = {"doctor": check_environment, "measure": measure_collection, "summarize": read_artifact_health,
-                "verify": verify_source, "prepare-review": prepare_review, "compare": compare_runs, "export": export_summary}
+                "verify": verify_source, "prepare-review": prepare_review, "compare": compare_runs, "export": export_summary,
+                "batch": measure_folders, "batch-refresh": refresh_batch}
     try:
         if command == "grade":
             grader.grade(**args)
