@@ -86,6 +86,10 @@ Perform actual contextual review and write each grade into `artifact-out/grades/
 Then run `artifact-health batch-refresh /path/to/artifact-out`. The root
 `artifact_health_score` uses `observed_quality_score`, with explicit `sample` or `full`
 scope, and shows factor scores, review coverage, findings, and detailed report links.
+Folder HTML reports include contextual findings, next actions, evidence locators and
+source exclusions. Confirmed-finding totals include both mechanical and contextual
+defects; the CSV also exposes those counts separately. Optional rendered review packets
+at `artifact-out/review-evidence/FOLDER/index.html` are linked when present.
 Never fill missing scores merely to complete the table. A sample score does not certify
 an entire folder. Subfolder tables contain automated measurements; they do not inherit
 the parent folder's contextual grade.

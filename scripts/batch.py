@@ -87,6 +87,9 @@ def refresh_batch(output):
         review = read_object(grade_dir / "review.json") if has_grade else None
         records = load_lines(directory / "inventory.jsonl")
         findings = load_lines(directory / "findings.jsonl")
+        contextual = review.get("findings", []) if review else []
+        confirmed_context = sum(f["kind"] == "DEFECT" and f["status"] == "confirmed" for f in contextual)
+        open_context = sum(f["kind"] == "REVIEW" and f["status"] != "explained" for f in contextual)
         reviewed = set()
         if review:
             reviewed = {path for d in review["dimensions"].values() for path in d["reviewed_paths"]}
@@ -101,8 +104,10 @@ def refresh_batch(output):
                "files_hashed": measurement["coverage"]["files_hashed"], "reviewed_files": len(reviewed),
                "extraction_coverage_pct": round(100 * counts.get("inspected", 0) / total, 2) if total else None,
                "exact_duplicate_copies": measurement["metrics"]["exact_duplicate_copies"],
-               "confirmed_findings": measurement["finding_counts"].get("DEFECT", 0),
-               "review_findings": measurement["finding_counts"].get("REVIEW", 0),
+               "confirmed_findings": measurement["finding_counts"].get("DEFECT", 0) + confirmed_context,
+               "mechanical_defects": measurement["finding_counts"].get("DEFECT", 0),
+               "contextual_defects": confirmed_context,
+               "review_findings": measurement["finding_counts"].get("REVIEW", 0) + open_context,
                "material_points": health["material"].get("material_points"),
                "validated_task_count": health["tasks"].get("validated_task_count"),
                **factor_scores, "measurement_run_id": measurement["run_id"],
@@ -116,13 +121,22 @@ def refresh_batch(output):
         body = '<p>' + str(_link('../index.html', 'All folders')) + '</p><p class="score">' + ('Unscored' if score is None else str(score) + ' / 100') + '</p><p class="note">' + html.escape(note) + ' The rubric is provisional. Confirmed defects still block acceptance.</p>'
         body += _table(['Files', 'Inspected', 'Unavailable', 'Reviewed files', 'Health status'], [[total, row['inspected'], row['unavailable'], len(reviewed), row['status']]])
         body += '<h2>Factor scores</h2>' + _table(['Factor', 'Weight', 'Score / 100', 'Evidence and reasoning'], [[v['label'],v['weight'],factor_scores[k] if factor_scores[k] is not None else 'Unscored',review['dimensions'][k]['reason'] if review else 'Contextual review has not run.'] for k,v in rubric['dimensions'].items()])
+        if review:
+            body += '<h2>Review scope</h2><p>' + html.escape(review['selection']) + '</p>'
+            body += _table(['Factor', 'Reviewed units', 'Eligible units in reviewed files'], [[rubric['dimensions'][k]['label'], json.dumps(f.get('units_reviewed', {})), json.dumps(f.get('units_eligible_in_reviewed_files', {}))] for k, f in quality['factors'].items()])
+            body += '<p>Unit counts describe only the evidence referenced for each factor. XML part coverage does not imply every cell or paragraph was read; consult the evidence locators. These are purposive sample scores, not population estimates or statistically comparable rankings.</p>'
+            body += '<h2>Contextual findings and next actions</h2>' + _table(['Type / severity', 'Check / status', 'Finding and next action', 'Evidence'], [[f['kind'] + ' / ' + f['severity'], f['code'] + ' / ' + f['status'], f['detail'], '; '.join(e['path'] + ' (' + e['locator'] + ')' for e in f['evidence'])] for f in contextual])
+            if (output / 'review-evidence' / name / 'index.html').is_file():
+                body += '<p>' + str(_link('../review-evidence/' + name + '/index.html', 'Open reviewed excerpts and rendered evidence')) + '</p>'
+        body += '<h2>Scope exclusions and limits</h2><p>Counts cover selected documentary formats. Missing parsers, timeouts and unread pages remain unverified. Duplicate copies are inventory facts, not automatic defects.</p>'
+        body += _table(['Excluded category', 'Count'], [[k, v] for k, v in sorted(measurement['coverage'].get('excluded', {}).items())])
         body += '<h2>Measurements by subfolder</h2>' + _table(['Subfolder', 'Files', 'Inspected', 'Invalid', 'Unavailable', 'Duplicate copies'], [[r[k] for k in ('collection','files','inspected','invalid','unavailable','duplicate_copies')] for r in measurement['collections']])
         body += '<h2>File formats</h2>' + _table(['Format','Files','Inspected','Unavailable'], [[ext,c['files'],c.get('inspected',0),c.get('unavailable',0)+c.get('changed',0)] for ext,c in measurement['coverage']['by_extension'].items()])
         finding_counts = Counter((f['kind'],f['code']) for f in findings)
         body += '<h2>Automated findings</h2>' + _table(['Type','Check','Occurrences'], [[kind,code,count] for (kind,code),count in sorted(finding_counts.items())])
         body += '<h2>Detailed outputs</h2><ul>' + ''.join('<li>' + str(_link(file,file)) + '</li>' for file in ['measurement.json','inventory.jsonl','findings.jsonl','artifact_collections.csv','artifact-health.json','run.json','measurement.log'] + (['../grades/' + name + '/' + file for file in ['grade.json','review.json','artifact_mining.json','artifact_material.json']] if has_grade else [])) + '</ul>'
         (directory / 'report.html').write_text(_page(name + ' — Artifact Health',body),encoding='utf-8')
-    fields = ['folder','artifact_health_score','score_scope','status','files','inspected','invalid','unavailable','files_hashed','reviewed_files','extraction_coverage_pct','exact_duplicate_copies','confirmed_findings','review_findings','material_points','validated_task_count',*rubric['dimensions'],'report']
+    fields = ['folder','artifact_health_score','score_scope','status','files','inspected','invalid','unavailable','files_hashed','reviewed_files','extraction_coverage_pct','exact_duplicate_copies','confirmed_findings','mechanical_defects','contextual_defects','review_findings','material_points','validated_task_count',*rubric['dimensions'],'report']
     scanner.write_csv(output / 'score-summary.csv', rows, fields)
     summary = {'schema':'artifact-health-folder-summary@1','updated_at':datetime.now(timezone.utc).isoformat(),
                'score_metric':'observed_quality_score','rubric_version':rubric['version'],'calibration_status':rubric['calibration_status'],
