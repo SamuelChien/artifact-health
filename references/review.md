@@ -81,7 +81,7 @@ and `NOT_CHECKED` for missing execution or evidence. Each contextual finding nee
 code, severity, evidence path/hash/locator, observed fact, expected behavior, and next
 action. Record valid controls for broad pattern findings.
 
-Review every mechanical finding and retain it with a disposition. A confirmed critical
+Review every mechanical finding and retain it with a disposition. Any confirmed
 defect blocks acceptance. Unresolved defects or review clues mean `needs_review`.
 Incomplete measurement or sampled context means `partial`, even if the observed score
 is high. `pass_within_scope` requires complete measurement and full reviewed coverage
@@ -107,8 +107,9 @@ timeline reconstruction, artifact creation/revision, or workflow follow-through.
 Give each instance a stable `dedupe_key` covering the business case, requested outcome,
 and evidence version. Same case/output with reworded instructions counts once, including
 copies found in several mailboxes. Distinct cases with the same template can be separate
-instances but remain one task family. The script validates exact keys, so the reviewer
-must also examine semantic duplicates.
+instances but remain one task family. The script rejects repeated keys and identical
+validated instances under different keys or copied evidence paths. The reviewer must
+still examine paraphrased and semantically overlapping tasks.
 
 Use these provisional depth weights:
 

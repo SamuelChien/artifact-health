@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Run the shared Artifact Health package from any working directory."""
+import os
+from pathlib import Path
+import sys
+
+root = Path(__file__).resolve().parent.parent
+python = root / ".venv" / "bin" / "python"
+executable = str(python) if python.is_file() else sys.executable
+os.execv(executable, [executable, "-B", str(root / "artifact_health.py"), *sys.argv[1:]])

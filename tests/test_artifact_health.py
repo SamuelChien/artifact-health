@@ -31,11 +31,14 @@ class ArtifactHealthTests(unittest.TestCase):
 
     def clean_review(self, scope="full"):
         measurement = json.loads((self.run / "measurement.json").read_text())
+        receipt = json.loads((self.run / "run.json").read_text())
         inventory = load_lines(self.run / "inventory.jsonl")
         evidence = [{"path": row["path"], "sha256": row["sha256"], "locator": "all fixture content"} for row in inventory]
         dimensions = json.loads(RUBRIC_PATH.read_text())["dimensions"]
         return {"rubric_version": "artifact-health-v1", "source_fingerprint": measurement["source_fingerprint"],
                 "inventory_sha256": measurement["inventory_sha256"],
+                "measurement_run_id": receipt["run_id"], "measurement_sha256": receipt["reports"]["measurement.json"],
+                "findings_sha256": measurement["findings_sha256"],
                 "reviewer": {"kind": "agent", "name": "test fixture", "model": "fixture-model"},
                 "selection": "Synthetic fixture only; no real corpus reviewed.",
                 "dimensions": {name: {"rating": 4, "scope": scope, "reviewed_paths": [row["path"] for row in inventory],

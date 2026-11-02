@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from collections import Counter, defaultdict
@@ -19,29 +20,18 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-VERSION = "artifact-health-measure@1"
+if __package__:
+    from .evidence import digest_file, write_json, evaluator_identity, run_receipt, source_fingerprint
+else:
+    from evidence import digest_file, write_json, evaluator_identity, run_receipt, source_fingerprint
+
+VERSION = "artifact-health-measure@2"
 RUBRIC_PATH = Path(__file__).resolve().parents[1] / "references/rubric.json"
 EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".eml", ".txt", ".md",
               ".csv", ".tsv", ".json", ".html", ".htm", ".doc", ".xls", ".ppt",
               ".pages", ".numbers", ".key", ".rtf", ".msg", ".mbox"}
 LEGACY = {".doc", ".xls", ".ppt", ".pages", ".numbers", ".key", ".rtf", ".msg", ".mbox"}
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"}
-
-
-def digest_file(path, deadline=float("inf")):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        while True:
-            if time.monotonic() >= deadline:
-                raise TimeoutError("run budget exhausted during hashing")
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-                return digest.hexdigest()
-            digest.update(chunk)
-
-
-def write_json(path, value):
-    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
 def write_csv(path, rows, fields):
@@ -126,12 +116,15 @@ def probe(path):
                     formula_count += sum(node.tag.rsplit("}", 1)[-1] == "f" for node in document.iter())
                 metrics.update(xml_parts_inspected=len(selected), native_text_characters=text_chars,
                                formula_cells=formula_count, package_members=len(names))
+                if ext == ".pptx":
+                    metrics["slides"] = len(selected) - 1
         elif ext == ".eml":
             message = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
             if not any(message.get(field) for field in ("From", "Date", "Subject", "Message-ID", "Received")):
                 note("EMAIL_NO_HEADERS", "No recognizable mail headers were found.", "DEFECT", "major")
             metrics["message_id"] = str(message.get("Message-ID", "")).strip() or None
             metrics["in_reply_to"] = str(message.get("In-Reply-To", "")).strip() or None
+            metrics["references"] = re.findall(r"<[^<>\s]+>", str(message.get("References", "")))
             try:
                 date = parsedate_to_datetime(str(message.get("Date", "")))
                 metrics["date_has_timezone"] = date.tzinfo is not None
@@ -200,42 +193,26 @@ def probe(path):
     return result
 
 
-def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_timeout=30,
-            max_files=None, max_file_mb=100):
-    root = Path(root).expanduser().resolve()
-    if not root.is_dir():
-        raise ValueError("source must be a directory")
-    if any(not math.isfinite(value) or value <= 0 for value in (budget_seconds, file_timeout, max_file_mb)) or (max_files is not None and max_files < 1):
-        raise ValueError("budgets, file limits, and timeouts must be positive")
-    exclusions = []
-    for item in exclude:
-        value = Path(item)
-        if value.is_absolute() or ".." in value.parts or str(value) in {"", "."}:
-            raise ValueError("exclusions must be nonempty paths relative to the source")
-        exclusions.append(value.as_posix().rstrip("/"))
-    out = new_output(out, root)
-    started = time.monotonic()
-    deadline = started + budget_seconds
-    files, records, findings, indexes = [], [], [], []
+def discover_files(root, scope, deadline=float("inf")):
+    """One selection policy shared by measurement and source freshness checks."""
+    files, errors = [], []
     excluded = Counter()
-    discovery_complete = True
-
-    def finding(code, path, detail, kind="NOT_CHECKED", severity="info", sha256=None):
-        findings.append({"id": f"F{len(findings) + 1:06d}", "kind": kind, "severity": severity,
-                         "code": code, "path": path, "sha256": sha256, "detail": detail})
+    complete = True
+    profile = scope["profile"]
+    exclusions = scope["exclude"]
 
     def walk_error(error):
-        nonlocal discovery_complete
-        discovery_complete = False
-        finding("DIRECTORY_UNREADABLE", ".", type(error).__name__)
+        nonlocal complete
+        complete = False
+        errors.append(type(error).__name__)
 
     def explicit_exclusion(relative):
         return any(relative == value or relative.startswith(value + "/") for value in exclusions)
 
     for parent, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
         if time.monotonic() >= deadline:
-            discovery_complete = False
-            finding("DISCOVERY_BUDGET", ".", "Discovery stopped at the run budget; total population is unknown.")
+            complete = False
+            errors.append("discovery_budget_exhausted")
             break
         retained = []
         for name in sorted(dirs):
@@ -243,7 +220,7 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
             relative = path.relative_to(root).as_posix()
             if path.is_symlink():
                 excluded["symlink_directories"] += 1
-            elif name in SKIP_DIRS or explicit_exclusion(relative):
+            elif name in scope["skip_directory_names"] or explicit_exclusion(relative):
                 excluded["excluded_directories"] += 1
             else:
                 retained.append(name)
@@ -256,19 +233,85 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
                 excluded["symlink_files"] += 1
             elif explicit_exclusion(relative):
                 excluded["explicit_files"] += 1
-            elif ext not in EXTENSIONS:
+            elif ext not in scope["extensions"]:
                 excluded["extension:" + (ext or "none")] += 1
             elif (profile == "documents" and ext in {".eml", ".msg", ".mbox"}) or (profile == "email" and ext not in {".eml", ".msg", ".mbox", ".json", ".txt", ".html", ".htm"}):
                 excluded["profile:" + ext] += 1
             else:
                 files.append((relative, path))
-    for number, (relative, path) in enumerate(sorted(files)):
+    return sorted(files), dict(excluded), complete, errors
+
+
+def snapshot_file(path, destination, deadline):
+    """Hash exactly the bytes given to the parser, in a temporary local copy."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source, destination.open("xb") as target:
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("run budget exhausted while copying parser input")
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            target.write(chunk)
+    return digest.hexdigest()
+
+
+def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_timeout=30,
+            max_files=None, max_file_mb=100):
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError("source must be a directory")
+    if profile not in {"mixed", "documents", "email"}:
+        raise ValueError("unknown measurement profile")
+    if any(not math.isfinite(value) or value <= 0 for value in (budget_seconds, file_timeout, max_file_mb)) or (max_files is not None and max_files < 1):
+        raise ValueError("budgets, file limits, and timeouts must be positive")
+    exclusions = []
+    for item in exclude:
+        value = Path(item)
+        if value.is_absolute() or ".." in value.parts or str(value) in {"", "."}:
+            raise ValueError("exclusions must be nonempty paths relative to the source")
+        exclusions.append(value.as_posix().rstrip("/"))
+    out = new_output(out, root)
+    scope = {"profile": profile, "exclude": sorted(set(exclusions)), "skip_directory_names": sorted(SKIP_DIRS),
+             "extensions": sorted(EXTENSIONS), "selection_version": 2}
+    with run_receipt(out, "measure", source_root=str(root)) as receipt:
+        result, code = _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file_mb, receipt["run_id"])
+        receipt.update(source_fingerprint=result["source_fingerprint"], measurement_status=result["status"], exit_code=code)
+    return result, code
+
+
+def _measure(root, out, scope, budget_seconds, file_timeout, max_files, max_file_mb, run_id):
+    started = time.monotonic()
+    deadline = started + budget_seconds
+    records, findings, indexes = [], [], []
+
+    def progress(phase, **details):
+        with (out / "measurement.log").open("a", encoding="utf-8") as log:
+            log.write(json.dumps({"phase": phase, "elapsed_seconds": round(time.monotonic() - started, 3), **details}) + "\n")
+
+    progress("discovery_started")
+
+    def finding(code, path, detail, kind="NOT_CHECKED", severity="info", sha256=None):
+        findings.append({"id": f"F{len(findings) + 1:06d}", "kind": kind, "severity": severity,
+                         "code": code, "path": path, "sha256": sha256, "detail": detail})
+
+    files, excluded, discovery_complete, discovery_errors = discover_files(root, scope, deadline)
+    progress("discovery_finished", files=len(files), complete=discovery_complete)
+    for error in discovery_errors:
+        finding("DISCOVERY_INCOMPLETE", ".", error)
+    for number, (relative, path) in enumerate(files):
+        if number % 100 == 0:
+            progress("inspection", completed=number, total=len(files))
         parts = Path(relative).parts
         record = {"path": relative, "collection": parts[0] if len(parts) > 1 else ".",
                   "extension": path.suffix.lower(), "bytes": None, "sha256": None,
                   "status": "unavailable", "metrics": {}}
         records.append(record)
         try:
+            if not path.resolve().is_relative_to(root) or path.is_symlink():
+                finding("SOURCE_PATH_CHANGED", relative, "Selected path now resolves outside the source or to a symlink.")
+                continue
             before = path.stat()
             record["bytes"] = before.st_size
             if max_files is not None and number >= max_files:
@@ -277,17 +320,23 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
             if before.st_size > max_file_mb * 1024 * 1024:
                 finding("FILE_SIZE_LIMIT", relative, "Exceeds the configured file size limit.")
                 continue
-            record["sha256"] = digest_file(path, deadline)
             if before.st_size == 0:
+                record["sha256"] = digest_file(path, deadline)
                 record["status"] = "invalid"
                 finding("EMPTY_FILE", relative, "File has zero bytes.", "DEFECT", "major", record["sha256"])
                 continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("run budget exhausted")
-            child = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "--probe-file", str(path)],
-                                   capture_output=True, text=True, encoding="utf-8", timeout=min(file_timeout, remaining))
+            with tempfile.TemporaryDirectory(prefix=".probe-", dir=out) as temporary:
+                snapshot = Path(temporary) / path.name
+                record["sha256"] = snapshot_file(path, snapshot, deadline)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("run budget exhausted")
+                child_env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SYSTEMROOT") if name in os.environ}
+                child = subprocess.run([sys.executable, "-E", "-B", str(Path(__file__).resolve()), "--probe-file", str(snapshot)],
+                                       capture_output=True, text=True, encoding="utf-8", cwd=temporary, env=child_env,
+                                       timeout=min(file_timeout, remaining))
             if child.returncode != 0:
+                progress("parser_process_failed", path=relative, returncode=child.returncode, stderr_tail=child.stderr[-2000:])
                 finding("PARSER_PROCESS_FAILED", relative, "Inspection process did not return a result.", sha256=record["sha256"])
                 continue
             result = json.loads(child.stdout)
@@ -307,12 +356,17 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
             finding("INSPECTION_UNAVAILABLE", relative, type(exc).__name__, sha256=record["sha256"])
 
     by_path = {record["path"]: record for record in records}
+    progress("inspection_finished", files=len(records))
     index_stats = Counter()
     for index_path, index in indexes:
         index_stats["indexes"] += 1
         index_stats["indexed_mailbox_copies"] += len(index["rows"])
         base = index["path_base"]
-        for row in index["rows"]:
+        for position, row in enumerate(index["rows"]):
+            if time.monotonic() >= deadline:
+                index_stats["rows_unchecked_budget"] += len(index["rows"]) - position
+                finding("INDEX_BUDGET_EXHAUSTED", index_path, "Run budget prevented remaining index-reference checks.")
+                break
             if not isinstance(row, dict) or not isinstance(base, str):
                 finding("INDEX_ROW_INVALID", index_path, "Invalid mailbox row or path_base.", "DEFECT", "major")
                 continue
@@ -352,9 +406,7 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
     status_counts = Counter(record["status"] for record in records)
     hash_counts = Counter(record["sha256"] for record in records if record["sha256"])
     message_ids = [record["metrics"].get("message_id") for record in records if record["extension"] == ".eml"]
-    scope = {"profile": profile, "exclude": sorted(exclusions), "skip_directory_names": sorted(SKIP_DIRS)}
-    fingerprint_rows = [[r["path"], r["bytes"], r["sha256"], r["status"] if not r["sha256"] else "hashed"] for r in records]
-    fingerprint = hashlib.sha256(json.dumps([scope, fingerprint_rows], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    fingerprint = source_fingerprint(scope, records)
     with (out / "inventory.jsonl").open("w", encoding="utf-8") as stream:
         for record in records:
             stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
@@ -373,14 +425,19 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
                             "unavailable": counts["unavailable"] + counts["changed"],
                             "duplicate_copies": len(hashes) - len(set(hashes))})
     incomplete = not discovery_complete or not records or any(f["kind"] == "NOT_CHECKED" for f in findings)
-    measurement = {"schema_version": 1, "measurer_version": VERSION,
+    by_extension = defaultdict(Counter)
+    for record in records:
+        by_extension[record["extension"]]["files"] += 1
+        by_extension[record["extension"]][record["status"]] += 1
+    measurement = {"schema_version": 2, "run_id": run_id, "measurer_version": VERSION, "evaluator": evaluator_identity(),
                    "measured_at": datetime.now(timezone.utc).isoformat(), "source_name": root.name, "source_root": str(root),
                    "source_fingerprint": fingerprint, "inventory_sha256": digest_file(out / "inventory.jsonl"),
                    "findings_sha256": digest_file(out / "findings.jsonl"),
                    "status": "partial" if incomplete else "complete", "scope": scope,
                    "limits": {"budget_seconds": budget_seconds, "file_timeout": file_timeout, "max_files": max_files, "max_file_mb": max_file_mb},
                    "coverage": {"discovery_complete": discovery_complete, "files_discovered": len(records),
-                                "files_hashed": sum(hash_counts.values()), "status_counts": dict(status_counts), "excluded": dict(excluded)},
+                                "files_hashed": sum(hash_counts.values()), "status_counts": dict(status_counts), "excluded": dict(excluded),
+                                "by_extension": {ext: dict(counts) for ext, counts in sorted(by_extension.items())}},
                    "metrics": {"unique_file_hashes": len(hash_counts), "exact_duplicate_copies": sum(hash_counts.values()) - len(hash_counts),
                                "eml_files": len(message_ids), "distinct_rfc_message_ids": len({value for value in message_ids if value}),
                                "eml_without_measured_id": sum(not value for value in message_ids)},
@@ -389,8 +446,8 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
                    "limitations": ["No visual, OCR, business-state, authorship, or semantic review was performed.",
                                     "Email index hashes do not establish raw/text semantic agreement.",
                                     "Embedded attachments are hashed, not document-reviewed.",
-                                    "Source file stability uses pre/post stat checks; inputs should be a stable snapshot.",
-                                    "The budget bounds discovery, hashing and parser work; local index verification/report writing follows."]}
+                                    "Parsers read hashed temporary copies; the collection is not an atomic filesystem snapshot. Use verify for current bytes.",
+                                    "The budget is checked during discovery, copying, parsing and index checks; final report writing follows."]}
     write_json(out / "measurement.json", measurement)
     write_json(out / "artifact_mining.json", {"status": "not_run", "material_points": None, "validated_task_count": None, "candidate_task_count": None, "tasks": []})
     collection_fields = ["collection", "files", "bytes", "inspected", "invalid", "unavailable", "duplicate_copies"]
@@ -399,7 +456,8 @@ def measure(root, out, profile="mixed", exclude=(), budget_seconds=900, file_tim
     summary = {"collection": root.name, "grade_status": "unscored", **{d: None for d in dimensions},
                "quality_score": None, "material_points": None, "validated_task_count": None}
     write_csv(out / "score-summary.csv", [summary], list(summary))
-    exit_code = 2 if incomplete else 1 if any(f["kind"] == "DEFECT" for f in findings) else 0
+    exit_code = 1 if any(f["kind"] == "DEFECT" for f in findings) else 2 if incomplete else 0
+    progress("reports_written", measurement_status=measurement["status"], exit_code=exit_code)
     return measurement, exit_code
 
 
@@ -423,7 +481,7 @@ def main():
         return code
     except (ValueError, OSError) as exc:
         print("artifact-health: " + str(exc), file=sys.stderr)
-        return 2
+        return 3
 
 
 if __name__ == "__main__":
