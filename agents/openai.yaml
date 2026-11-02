@@ -1,0 +1,4 @@
+interface:
+  display_name: "Artifact Health"
+  short_description: "Score document and email collections with evidence"
+  default_prompt: "Use $artifact-health to measure this document or email collection and report evidence-backed quality scores and useful tasks."

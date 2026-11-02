@@ -1,0 +1,24 @@
+{
+  "version": "artifact-health-v1",
+  "calibration_status": "provisional",
+  "dimensions": {
+    "integrity": {"weight": 15, "label": "Technical integrity"},
+    "readability": {"weight": 10, "label": "Readability and extraction"},
+    "completeness": {"weight": 20, "label": "Completeness"},
+    "consistency": {"weight": 25, "label": "Business consistency"},
+    "provenance": {"weight": 15, "label": "Dates, versions, and provenance"},
+    "communication": {"weight": 15, "label": "Presentation and communication"}
+  },
+  "ratings": {
+    "0": "Demonstrated failure makes the reviewed material unusable for this dimension.",
+    "1": "Major defects prevent reliable use without substantial correction.",
+    "2": "Mixed results; material defects or unresolved contextual questions remain.",
+    "3": "Usable in the reviewed scope with minor documented limitations.",
+    "4": "Meets the dimension's requirements throughout the stated reviewed scope."
+  },
+  "task_depth_weights": {"1": 1.0, "2": 2.0, "3": 3.0},
+  "task_families": [
+    "extract_and_structure", "reconcile_and_audit", "compare_and_decide",
+    "reconstruct_timeline", "create_or_revise", "workflow_followthrough"
+  ]
+}
