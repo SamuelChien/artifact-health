@@ -1,5 +1,26 @@
 # Design lessons from repo-health
 
+## Implemented v3 comparison
+
+The downloaded `/Users/samuelchien/Downloads/repo-quality-evaluation-measure-ext` separates MEASURE from GRADE. Its material census estimates 0–6 logic depth, self-containment and category counts; its task miner enumerates ideas, capped by `--mine-n` (default 150). Neither model lane executes those proposed tasks. The default overall budget is 9,000 seconds, with nulls for runner-owned missing measurements. Its authenticity collector reports source/history clues, not calibrated document AI probabilities.
+
+Artifact Health v3 adopts version-bound evidence, explicit nulls, execution receipts, restricted provider tools and retained failures. It changes the following mechanisms:
+
+| Concern | Downloaded repository evaluator | Artifact Health v3 |
+| --- | --- | --- |
+| Points | Weighted overlapping material-category counts | Distinct usable task sets; no credit for splitting evidence or changing labels |
+| Task evidence | Proposed coding task ideas | Exact input/output spans, applicable executed checks and separate source-grounded review |
+| Completion | Global time budget and task cap | Full resumable queue; per-job failures visible; partial pilots labeled |
+| Provenance | Git/source declarations and history clues | Asserted metadata, date checks, local PDF signatures/C2PA; unknown preserved |
+| Native content | Code and executed build/tests | PDF/Office rendering, cell/formula/recalculation, image/OCR, JSON/CSV and MIME/attachments |
+| Connected tasks | Code/history context | Reply/attachment links, grounded business IDs, cross-packet retrieval and reviewed graphs |
+| Folder score | Repository-level measurement | Recursive direct/aggregate coverage, unioned tasks, standalone/linked readiness |
+| Datasets | Task summaries | Role datasets with withheld answers and connected-case/shared-evidence split groups |
+
+The Codex lane uses the existing account with ephemeral execution, schema-constrained output, disabled shell/web tools and saved actual receipts. Source excerpts/images reach that provider; reports stay local. Hashes detect changes, not model correctness. Rich artifact datasets contain company evidence and are not the repository package's sanitized numeric export.
+
+The historical v2 comparison below is retained for old reports. New evaluations use [the v3 contract](v3-contract.md).
+
 For the additional eight-area workflow score and native-format evidence collectors,
 see [workflow-readiness.md](workflow-readiness.md). The downloaded reference at
 `/Users/samuelchien/Downloads/repo-quality-evaluation-measure-ext` was additionally

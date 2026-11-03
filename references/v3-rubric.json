@@ -1,0 +1,17 @@
+{
+  "schema": "artifact-health-v3",
+  "workflow": "workflow-readiness@2",
+  "readiness": {"formula": "100 * ready / (ready + not_ready)", "empty_denominator": null},
+  "capacity": "distinct ready input/output task sets; no depth points",
+  "coverage": ["canonical native units reviewed", "assessed eligible tasks", "unavailable native checks", "blocked jobs"],
+  "required_independent_gates": ["grounded_need", "input_completeness", "output_correctness", "answer_separation", "native_fidelity", "supported_connections", "chronology", "origin_disclosure", "task_independence"],
+  "additional_findings": ["high_value", "end_to_end", "business_completion_evidence"],
+  "objective_checks": ["numeric_equal", "sum_equal", "difference_equal", "product_equal", "text_equal", "date_order", "json_schema"],
+  "numeric_absolute_tolerance_maximum": 0.01,
+  "states": ["ready", "not_ready", "unknown"],
+  "business_origins": ["corroborated_business", "declared_simulation", "unknown"],
+  "ai_involvement": ["declared_generated", "declared_assisted", "unknown"],
+  "task_kinds": ["historical_employee_task", "reconstructed_analysis", "simulation"],
+  "employee_roles": ["accounts_payable", "billing_receivables", "sales", "procurement", "logistics", "quality_compliance", "facilities_maintenance", "corporate_administration", "unknown"],
+  "not_estimated": ["AI probability from style", "work hours from metadata", "unobserved task population", "external business completion without records"]
+}

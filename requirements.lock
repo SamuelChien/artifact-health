@@ -1,0 +1,11 @@
+# Tested runtime dependency versions for the v3 pipeline.
+c2pa-python==0.38.2
+charset-normalizer==3.4.3
+jsonschema==4.25.0
+openpyxl==3.1.5
+pillow==12.2.0
+pillow_heif==1.8.1
+pyHanko==0.38.0
+pypdf==6.0.0
+python-docx==1.2.0
+reportlab==5.0.1

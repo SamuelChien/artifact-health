@@ -221,6 +221,7 @@ def grade(run, review, out):
             candidates.append(task)
     ran = mining["status"] == "complete" or bool(validated)
     mining_result = {"status": mining["status"], "search_scope": mining.get("search_scope", ""), "exhaustive": False,
+                     "assessment_mode":"legacy_reviewer_attestation", "verified_capacity":None,
                      "material_points": material_result["material_points"],
                      "validation_basis": "reviewer-recorded output evidence and acceptance result",
                      "validated_task_count": len(validated) if ran else None,
@@ -228,6 +229,7 @@ def grade(run, review, out):
                      "validated_by_family": dict(Counter(t["family"] for t in validated)) if ran else None,
                      "validated_by_depth": dict(Counter(t["depth"] for t in validated)) if ran else None, "tasks": tasks}
     result = {"schema_version": 2, "rubric_version": rubric["version"], "calibration_status": rubric["calibration_status"],
+              "assessment_mode":"legacy_reviewer_attestation", "verified_capacity":None,
               "acceptance_policy": "artifact-health-gates@2", "measurement_run_id": receipt["run_id"],
               "measurement_sha256": receipt["reports"]["measurement.json"], "evaluator": measurement["evaluator"],
               "grader_evaluator": evaluator_identity(),

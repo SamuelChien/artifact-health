@@ -44,7 +44,7 @@ def write_json(path, value):
 
 
 def evaluator_identity():
-    sources = [*sorted((ROOT / "scripts").glob("*.py")), ROOT / "artifact_health.py"]
+    sources = [*sorted((ROOT / "scripts").glob("*.py")), *sorted((ROOT / "artifact_engine").glob("*.py")), ROOT / "artifact_health.py"]
     code = {str(path.relative_to(ROOT)): digest_file(path) for path in sources if path.is_file()}
     try:
         pdf_version = metadata.version("pypdf")

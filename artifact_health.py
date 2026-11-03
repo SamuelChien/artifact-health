@@ -30,13 +30,21 @@ def check_environment():
     pdf_ok = bool(version and int(version.split(".")[0]) >= 5)
     checks = [{"name": "python", "ok": sys.version_info >= (3, 10), "installed": identity["python"]},
               {"name": "pypdf", "ok": pdf_ok, "installed": version, "required_for": "PDF inspection"}]
+    from importlib import metadata
+    for name in ('Pillow','pillow-heif','openpyxl','python-docx','jsonschema','reportlab','charset-normalizer','c2pa-python','pyHanko'):
+        try: installed=metadata.version(name)
+        except metadata.PackageNotFoundError: installed=None
+        checks.append({'name':name,'ok':installed is not None,'installed':installed,'required_for':'v3 native evaluation'})
+    for name in ('pdftoppm','soffice','tesseract','codex'):
+        checks.append({'name':name,'ok':bool(shutil.which(name)),'installed':shutil.which(name),'required_for':'full v3 evaluation'})
     return {"status": "passed" if all(c["ok"] for c in checks) else "incomplete",
             "ready": all(c["ok"] for c in checks), "checks": checks, "evaluator": identity,
             "optional_capabilities": {"pdf_rendering": bool(shutil.which("pdftoppm")),
                                       "office_conversion": bool(shutil.which("soffice")),
                                       "ocr": bool(shutil.which("tesseract"))},
             "model_calls": False,
-            "limitations": ["Optional tools are detected, not executed; the scanner does not automatically render or OCR.",
+            "ocr_languages":{lang:(ROOT/'.venv/share/tessdata'/(lang+'.traineddata')).is_file() for lang in ('eng','chi_sim','chi_tra')},
+            "limitations": ["Tools are detected, not executed. evaluate uses native render/OCR; legacy measure retains its original scope.",
                             "Formats without an installed reader remain explicitly unmeasured."]}
 
 
@@ -58,6 +66,10 @@ def _grade_for_measurement(measurement, receipt, grade_directory):
 
 def read_artifact_health(directory, grade_directory=None, require="full"):
     """Read retained evidence. A clean scanner run alone cannot establish full health."""
+    if (Path(directory)/'state.sqlite').exists():
+        if grade_directory:raise ValueError('v3 keeps independent validation inside its own run; do not mix a legacy grade')
+        from artifact_engine.integrity import read_run
+        return read_run(directory)
     if require not in {"mechanical", "quality", "full"}:
         raise ValueError("require must be mechanical, quality, or full")
     measurement, receipt, _, findings = validate_measurement(directory)
@@ -98,6 +110,7 @@ def read_artifact_health(directory, grade_directory=None, require="full"):
         issue("material_assessment", "incomplete", "The independent material assessment has not completed.")
     status = "failed" if any(i["status"] == "failed" for i in issues) else "incomplete" if issues else "passed"
     return {"schema": "artifact-health@2", "status": status, "required_evidence": require, "issues": issues,
+            "task_validation_mode":"legacy reviewer attestation; not v3 verified capacity", "verified_capacity":None,
             "run_id": receipt["run_id"], "source_fingerprint": measurement["source_fingerprint"],
             "source_name": measurement["source_name"], "source_freshness": "measured_snapshot_only",
             "measured_at": measurement["measured_at"], "evaluator": measurement["evaluator"],
@@ -121,6 +134,9 @@ def measure_collection(root, output=None, **options):
 
 def verify_source(directory, source=None, budget_seconds=900):
     """Compare current selected paths and bytes with a sealed measurement snapshot."""
+    if (Path(directory)/'state.sqlite').exists():
+        from artifact_engine.integrity import verify_source as verify_v3
+        return verify_v3(directory,source)
     if not math.isfinite(budget_seconds) or budget_seconds <= 0:
         raise ValueError("verification budget must be finite and positive")
     measurement, receipt, records, _ = validate_measurement(directory)
@@ -260,6 +276,10 @@ def prepare_review(directory, output, seed="artifact-health-v2", per_stratum=3):
 
 
 def compare_runs(before, after, before_grade=None, after_grade=None):
+    if any((Path(path)/'state.sqlite').exists() for path in (before,after)):
+        if before_grade or after_grade:raise ValueError('do not mix legacy grades into a v3 comparison')
+        from artifact_engine.integrity import compare as compare_v3
+        return compare_v3(before,after)
     left = read_artifact_health(before, before_grade)
     right = read_artifact_health(after, after_grade)
     reasons = []
@@ -321,6 +341,19 @@ def export_summary(directory, grade_directory=None, output=None):
     """Allowlisted numeric/enum export. No paths, IDs, names, prose, or task descriptions."""
     health = read_artifact_health(directory, grade_directory)
     numeric = lambda value: value if type(value) in (int, float) and math.isfinite(value) else None
+    if health.get('schema')=='artifact-health-v3':
+        from artifact_engine.contracts import ROLES
+        keys=('readiness_score','capacity','eligible_tasks','assessed_tasks','unknown_tasks','task_coverage','end_to_end_tasks')
+        result={'schema':'artifact-health-external@3','status':health['status'],
+                'tasks':{k:numeric(health['tasks'].get(k)) for k in keys},
+                'native_unit_coverage':{k:numeric(health['native_unit_coverage'].get(k)) for k in ('total','reviewed')},
+                'roles':{r:{k:numeric(health['roles'][r].get(k)) for k in keys} for r in ROLES}}
+        if output is not None:
+            target=Path(output).expanduser().resolve()
+            if target.is_relative_to(Path(health['scope']['root'])):raise ValueError('external summary must be outside the source tree')
+            target.parent.mkdir(parents=True,exist_ok=True)
+            with target.open('x') as stream:stream.write(json.dumps(result,indent=2,allow_nan=False)+'\n')
+        return result
     quality = health["quality"]
     dimensions = read_object(scanner.RUBRIC_PATH)["dimensions"]
     result = {"schema": "artifact-health-external@2", "status": health["status"],
@@ -348,6 +381,23 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor")
+    evaluation=commands.add_parser('evaluate',help='v3 full resumable native inspection, task mining and independent validation')
+    evaluation.add_argument('root')
+    evaluation.add_argument('--out',dest='output',required=True)
+    evaluation.add_argument('--folders',nargs='+')
+    evaluation.add_argument('--provider',choices=['codex'],default='codex')
+    evaluation.add_argument('--coverage',choices=['full'],default='full')
+    evaluation.add_argument('--model',default='gpt-6-astra')
+    evaluation.add_argument('--reasoning',default='max')
+    evaluation.add_argument('--workers',type=int,default=4)
+    evaluation.add_argument('--file-timeout',type=int,default=300)
+    evaluation.add_argument('--max-jobs',type=int,help='explicit partial pilot cap per model phase; never a full score')
+    resume_parser=commands.add_parser('resume')
+    resume_parser.add_argument('directory')
+    resume_parser.add_argument('--max-jobs',type=int)
+    resume_parser.add_argument('--retry-blocked',action='store_true')
+    dataset=commands.add_parser('export-dataset')
+    dataset.add_argument('directory');dataset.add_argument('--out',dest='output',required=True);dataset.add_argument('--role')
     measure = commands.add_parser("measure")
     measure.add_argument("root")
     measure.add_argument("--out", dest="output")
@@ -410,14 +460,20 @@ def main(argv=None):
     from scripts.batch import measure_folders, refresh_batch
     from scripts.workflow import grade_workflows, compare_workflows
     from scripts.census import census
+    from artifact_engine.pipeline import evaluate, resume
+    from artifact_engine.datasets import export_dataset
     handlers = {"doctor": check_environment, "measure": measure_collection, "summarize": read_artifact_health,
                 "verify": verify_source, "prepare-review": prepare_review, "compare": compare_runs, "export": export_summary,
                 "batch": measure_folders, "batch-refresh": refresh_batch,
-                "workflow-grade": grade_workflows, "workflow-compare": compare_workflows, "census": census}
+                "workflow-grade": grade_workflows, "workflow-compare": compare_workflows, "census": census,
+                "evaluate":evaluate,"resume":resume,"export-dataset":export_dataset}
     try:
         if command == "grade":
             grader.grade(**args)
             result = read_artifact_health(args["run"], args["out"])
+        elif command=='compare' and any((Path(args[k])/'state.sqlite').exists() for k in ('before','after')):
+            from artifact_engine.integrity import compare as compare_v3
+            result=compare_v3(**args)
         else:
             result = handlers[command](**args)
         code = EXIT_CODES[result["status"]]
