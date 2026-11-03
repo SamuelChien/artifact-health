@@ -367,6 +367,18 @@ def main(argv=None):
     batch.add_argument("--max-file-mb", type=float, default=512)
     refresh = commands.add_parser("batch-refresh")
     refresh.add_argument("output")
+    census_parser = commands.add_parser("census")
+    census_parser.add_argument("root")
+    census_parser.add_argument("--folders", nargs="+", required=True)
+    census_parser.add_argument("--out", required=True)
+    workflow = commands.add_parser("workflow-grade")
+    workflow.add_argument("run")
+    workflow.add_argument("--protocol", required=True)
+    workflow.add_argument("--review", required=True)
+    workflow.add_argument("--out", required=True)
+    workflow_compare = commands.add_parser("workflow-compare")
+    workflow_compare.add_argument("before")
+    workflow_compare.add_argument("after")
     summary = commands.add_parser("summarize")
     summary.add_argument("directory")
     summary.add_argument("--grade", dest="grade_directory")
@@ -396,9 +408,12 @@ def main(argv=None):
     args = vars(parser.parse_args(argv))
     command = args.pop("command")
     from scripts.batch import measure_folders, refresh_batch
+    from scripts.workflow import grade_workflows, compare_workflows
+    from scripts.census import census
     handlers = {"doctor": check_environment, "measure": measure_collection, "summarize": read_artifact_health,
                 "verify": verify_source, "prepare-review": prepare_review, "compare": compare_runs, "export": export_summary,
-                "batch": measure_folders, "batch-refresh": refresh_batch}
+                "batch": measure_folders, "batch-refresh": refresh_batch,
+                "workflow-grade": grade_workflows, "workflow-compare": compare_workflows, "census": census}
     try:
         if command == "grade":
             grader.grade(**args)

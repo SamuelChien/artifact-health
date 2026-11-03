@@ -27,17 +27,19 @@ if __package__:
     from .evidence import digest_file, write_json, evaluator_identity, run_receipt, source_fingerprint
     from .relations import analyze
     from .workers import ParserWorkers
+    from .content_signals import IMAGE_EXTENSIONS, image_metrics, origin_signals, pdf_metadata, office_metadata, invalid_reference
 else:
     from evidence import digest_file, write_json, evaluator_identity, run_receipt, source_fingerprint
     from relations import analyze
     from workers import ParserWorkers
+    from content_signals import IMAGE_EXTENSIONS, image_metrics, origin_signals, pdf_metadata, office_metadata, invalid_reference
 
-VERSION = "artifact-health-measure@3"
+VERSION = "artifact-health-measure@4"
 RUBRIC_PATH = Path(__file__).resolve().parents[1] / "references/rubric.json"
 EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".eml", ".txt", ".md",
               ".csv", ".tsv", ".json", ".html", ".htm", ".doc", ".xls", ".ppt",
-              ".pages", ".numbers", ".key", ".rtf", ".msg", ".mbox"}
-LEGACY = {".doc", ".xls", ".ppt", ".pages", ".numbers", ".key", ".rtf", ".msg", ".mbox"}
+              ".pages", ".numbers", ".key", ".rtf", ".msg", ".mbox", ".heic", ".heif"} | IMAGE_EXTENSIONS
+LEGACY = {".doc", ".xls", ".ppt", ".pages", ".numbers", ".key", ".rtf", ".msg", ".mbox", ".heic", ".heif"}
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"}
 
 
@@ -77,6 +79,12 @@ def probe(path):
         if ext in LEGACY:
             result["status"] = "unavailable"
             note("EXTRACTOR_UNAVAILABLE", "Format is inventoried; conversion or a format-specific reader is required.", "NOT_CHECKED", "info")
+        elif ext in IMAGE_EXTENSIONS:
+            try:
+                metrics.update(image_metrics(path))
+            except ImportError:
+                result["status"] = "unavailable"
+                note("IMAGE_DEPENDENCY_MISSING", "Install Pillow for raster inspection.", "NOT_CHECKED", "info")
         elif ext == ".pdf":
             try:
                 import pypdf
@@ -93,7 +101,11 @@ def probe(path):
                 return result
             metrics["pages"] = len(reader.pages)
             metrics["review_units"] = {"kind": "page", "count": metrics["pages"]}
-            lengths = [len((page.extract_text() or "").strip()) for page in reader.pages]
+            texts = [(page.extract_text() or "").strip() for page in reader.pages]
+            lengths = [len(text) for text in texts]
+            metrics["document_metadata"] = pdf_metadata(reader)
+            metrics["origin_signals"] = origin_signals("\n".join(texts))
+            metrics["page_geometry_points"] = [[float(p.mediabox.width), float(p.mediabox.height)] for p in reader.pages]
             metrics["native_text_characters"] = sum(lengths)
             metrics["pages_without_native_text"] = sum(length == 0 for length in lengths)
             if not lengths:
@@ -109,6 +121,15 @@ def probe(path):
                 main = {".docx": "word/document.xml", ".xlsx": "xl/workbook.xml",
                         ".pptx": "ppt/presentation.xml", ".odt": "content.xml"}[ext]
                 names = set(archive.namelist())
+                metrics["document_metadata"] = office_metadata(archive)
+                metrics["embedded_media_members"] = sum("/media/" in name for name in names)
+                invalid_refs = []
+                if ext == ".xlsx":
+                    workbook = ET.fromstring(archive.read(main))
+                    metrics["invalid_defined_names"] = [{"name": node.get("name"), "formula": node.text}
+                        for node in workbook.iter() if node.tag.rsplit("}", 1)[-1] == "definedName" and invalid_reference(node.text)]
+                    if metrics["invalid_defined_names"]:
+                        note("SPREADSHEET_INVALID_DEFINED_NAME", "Workbook contains defined names with invalid references.", "DEFECT", "major")
                 if len(names) != len(archive.namelist()):
                     note("OFFICE_DUPLICATE_PART", "Package contains duplicate member names.", "DEFECT", "major")
                 if archive.testzip() is not None:
@@ -129,6 +150,11 @@ def probe(path):
                 if ext != ".odt":
                     ET.fromstring(archive.read("[Content_Types].xml"))
                 selected = [main]
+                if ext == ".docx":
+                    selected += sorted(n for n in names if re.fullmatch(r"word/(?:header\d+|footer\d+|footnotes|endnotes|comments)\.xml", n))
+                    doc = ET.fromstring(archive.read(main))
+                    tags = Counter(node.tag.rsplit("}", 1)[-1] for node in doc.iter())
+                    metrics.update(paragraphs=tags["p"], tables=tags["tbl"], drawings=tags["drawing"], textboxes=tags["txbxContent"])
                 if ext == ".xlsx":
                     selected += sorted(n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
                     if "xl/sharedStrings.xml" in names:
@@ -138,8 +164,10 @@ def probe(path):
                 text_chars = 0
                 formula_count = 0
                 errors = uncached = 0
+                origin_text = []
                 for name in selected:
                     document = ET.fromstring(archive.read(name))
+                    origin_text.extend(node.text or "" for node in document.iter() if node.tag.rsplit("}", 1)[-1] in {"t", "p", "span"})
                     text_chars += sum(len(node.text or "") for node in document.iter() if node.tag.rsplit("}", 1)[-1] in {"t", "p", "span"})
                     formula_count += sum(node.tag.rsplit("}", 1)[-1] == "f" for node in document.iter())
                     if ext == ".xlsx":
@@ -148,10 +176,17 @@ def probe(path):
                                 children = {child.tag.rsplit("}", 1)[-1]: child for child in node}
                                 errors += node.get("t") == "e"
                                 uncached += "f" in children and ("v" not in children or not children["v"].text)
+                                if "f" in children and invalid_reference(children["f"].text):
+                                    invalid_refs.append({"part": name, "cell": node.get("r"), "formula": children["f"].text,
+                                                         "shared_range": children["f"].get("ref")})
+                metrics["origin_signals"] = origin_signals(" ".join(origin_text))
                 metrics.update(xml_parts_inspected=len(selected), native_text_characters=text_chars,
                                formula_cells=formula_count, package_members=len(names), external_relationships=external,
                                review_units={"kind": "part", "count": len(selected), "labels": selected})
                 if ext == ".xlsx":
+                    metrics["invalid_reference_formulas"] = invalid_refs
+                    if invalid_refs:
+                        note("SPREADSHEET_INVALID_FORMULA_REFERENCE", "Formula definitions contain #REF!, including references masked by IFERROR.", "DEFECT", "major")
                     metrics.update(cached_error_cells=errors, formula_cells_without_cached_values=uncached)
                     if errors or uncached:
                         note("SPREADSHEET_CALCULATION_REVIEW", "Cached errors or missing formula values require recalculation and review.")
@@ -162,6 +197,8 @@ def probe(path):
             if not any(message.get(field) for field in ("From", "Date", "Subject", "Message-ID", "Received")):
                 note("EMAIL_NO_HEADERS", "No recognizable mail headers were found.", "DEFECT", "major")
             metrics["message_id"] = str(message.get("Message-ID", "")).strip() or None
+            metrics["document_metadata"] = {"asserted": {field: str(message.get(field, "")) for field in ("From", "To", "Date", "Subject")},
+                                             "authenticated_creator": None, "transport_authentication_verified": False}
             metrics["in_reply_to"] = str(message.get("In-Reply-To", "")).strip() or None
             metrics["reply_ids"] = re.findall(r"<[^<>\s]+>", metrics["in_reply_to"] or "")
             metrics["references"] = re.findall(r"<[^<>\s]+>", str(message.get("References", "")))
@@ -176,6 +213,7 @@ def probe(path):
                 note("EMAIL_DATE_UNKNOWN", "No usable native Date header; chronology requires other evidence.")
             attachments = []
             text_chars = 0
+            origin_text = []
             defects = []
             content_parts = []
             leaf_number = 0
@@ -198,11 +236,14 @@ def probe(path):
                                         "sha256": hashlib.sha256(payload).hexdigest()})
                 elif part.get_content_maintype() == "text":
                     try:
-                        text_chars += len(payload.decode(part.get_content_charset() or "ascii"))
+                        decoded = payload.decode(part.get_content_charset() or "ascii")
+                        text_chars += len(decoded)
+                        origin_text.append(decoded)
                     except (UnicodeError, LookupError):
                         note("EMAIL_CHARSET_REVIEW", "A text part could not be decoded with its declared/default charset.")
             metrics.update(named_or_attachment_parts=attachments, body_characters_including_quotes=text_chars,
                            mime_defects=sorted(set(defects)), review_units={"kind": "part", "count": leaf_number})
+            metrics["origin_signals"] = origin_signals("\n".join(origin_text))
             authored_headers = [str(message.get(name, "")) for name in ("From", "To", "Cc", "Subject", "Date", "In-Reply-To", "References")]
             metrics["content_sha256"] = hashlib.sha256(json.dumps([authored_headers, content_parts], ensure_ascii=False).encode()).hexdigest()
             if defects:
@@ -217,9 +258,13 @@ def probe(path):
                 note("TEXT_ENCODING_UNKNOWN", "Not UTF-8 or BOM-marked UTF-16; select the actual encoding before grading.", "NOT_CHECKED", "info")
                 return result
             metrics["text_characters"] = len(text)
+            metrics["origin_signals"] = origin_signals(text)
             metrics["review_units"] = {"kind": "file", "count": 1}
             if ext == ".json":
                 data = json.loads(text)
+                metrics["json_shape"] = {"type": type(data).__name__, "items": len(data) if isinstance(data, (dict, list)) else None,
+                                         "top_level_keys": sorted(data)[:100] if isinstance(data, dict) else None,
+                                         "schema_validation": "not_checked", "source_fidelity": "not_checked"}
                 if path.name == "index.json" and isinstance(data, dict) and isinstance(data.get("messages"), list):
                     rows = data["messages"]
                     if any(isinstance(row, dict) and any(key in row for key in ("eml_file", "text_file", "original_file")) for row in rows):

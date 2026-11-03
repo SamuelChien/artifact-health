@@ -50,8 +50,13 @@ def evaluator_identity():
         pdf_version = metadata.version("pypdf")
     except metadata.PackageNotFoundError:
         pdf_version = None
+    try:
+        pillow_version = metadata.version("Pillow")
+    except metadata.PackageNotFoundError:
+        pillow_version = None
     return {"code_sha256": hashlib.sha256(json.dumps(code, sort_keys=True).encode()).hexdigest(),
             "python": platform.python_version(), "pypdf": pdf_version,
+            "pillow": pillow_version,
             "rubric_sha256": digest_file(ROOT / "references/rubric.json")}
 
 

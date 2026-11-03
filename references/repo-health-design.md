@@ -1,5 +1,14 @@
 # Design lessons from repo-health
 
+For the additional eight-area workflow score and native-format evidence collectors,
+see [workflow-readiness.md](workflow-readiness.md). The downloaded reference at
+`/Users/samuelchien/Downloads/repo-quality-evaluation-measure-ext` was additionally
+inspected for this extension. Its `collectors/authenticity.py` collects source-code
+declarations/comment patterns and history clues; it is not a calibrated document-origin
+classifier. Its weighted material census is unbounded and intentionally overlaps
+categories. Neither its points nor its proposed coding tasks establish artifact
+quality or completed employee business workflows. That evaluator is left unchanged.
+
 Reference inspected: the local `repo-health` wrapper, its build-evidence adapter,
 tests, material census, task miner, and child-process controls in
 `~/dev/repo-quality-evaluation-measure-ext` at the observed commit `7da49ef`. This work

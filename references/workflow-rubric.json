@@ -1,0 +1,15 @@
+{
+  "version": "workflow-readiness@1",
+  "metric": "verified_evidence_points",
+  "calibration": "provisional; measures demonstrated evidence readiness, not human origin or population quality",
+  "dimensions": {
+    "origin": {"weight": 10, "checks": {"input_origin": "Original origin supported by evidence beyond style or author metadata", "output_disclosure": "Derivative origin and exact source lineage disclosed"}},
+    "authenticity": {"weight": 10, "checks": {"creator_attribution": "Creator assertions, verified identities and unknowns explicitly distinguished", "chronology": "Business, save, export and analysis times distinguished; no future-input leakage"}},
+    "task_value": {"weight": 15, "checks": {"grounded_need": "Concrete consequential task and role supported by source content", "verified_result": "Substantive outcome independently checked against sources"}},
+    "completeness": {"weight": 15, "checks": {"required_content": "Required task-specific fields and calculations available", "dependencies": "Missing evidence, exceptions and remaining business actions explicit"}},
+    "input_output": {"weight": 10, "checks": {"usable_inputs": "Required input bytes inspected and available", "distinct_output": "A substantive usable output separate from inputs exists"}},
+    "connections": {"weight": 10, "checks": {"supported_edges": "Each workflow link has a cited business or derivation basis", "connected_path": "Every required input reaches a demonstrated output through an acyclic graph"}},
+    "end_to_end": {"weight": 20, "checks": {"stage_coverage": "All frozen required analytical stages have evidence", "independent_acceptance": "Separate reviewer confirms final output; real business completion is separately stated"}},
+    "content_type": {"weight": 10, "checks": {"native_checks": "Native contents, calculations and extraction fidelity checked as applicable", "presentation": "Relevant rendered pages, sheets or images actually reviewed"}}
+  }
+}
