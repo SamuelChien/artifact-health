@@ -482,7 +482,9 @@ def validate_all(store,provider,max_jobs=None):
                     candidate=json.loads(other['data'])
                     related.append({'task_id':other['id'],**{k:candidate[k] for k in ('business_case','role','outcome_key','title','instruction','inputs','outputs')}})
                 review,execution=provider.call("validate",{"task_id":row['id'],"task":task,"evidence":evidence,
-                    "related_tasks":related,"objective_results":preliminary["checks"]},images,validate=validate_review)
+                    "related_tasks":related,"related_task_catalogue_complete":bool(store.get('mining_complete')),
+                    "related_task_catalogue_scope":"same connected component in this inspected snapshot",
+                    "objective_results":preliminary["checks"]},images,validate=validate_review)
                 review.update(task_sha256=digest(task),execution_id=execution["execution_id"],
                               proposer_execution_id=task["proposer_execution_id"],execution=execution)
             else: review=None

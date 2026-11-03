@@ -26,7 +26,7 @@ STR = {"type":"string"}
 BOOL = {"type":"boolean"}
 NULLSTR = {"type":["string","null"]}
 REF = obj({"unit_id":STR,"start":{"type":"integer"},"end":{"type":"integer"}})
-REVIEW = obj({"state":enum("met","failed","unknown"),"reason":STR,"evidence":arr(REF)})
+REVIEW = obj({"state":enum("met","failed","unknown","not_applicable"),"reason":STR,"evidence":arr(REF)})
 REVIEW_KEYS = ("grounded_need", "input_completeness", "output_correctness", "answer_separation", "native_fidelity",
                "supported_connections", "chronology", "high_value", "origin_disclosure", "task_independence")
 DOCUMENT_TYPES = ("invoice","quote","purchase_order","receipt","payment","contract","permit","certificate",
@@ -123,7 +123,14 @@ labels against evidence: unknown and reconstructed are legitimate labels; unsupp
 Check task_independence against the related_tasks catalogue: field/page fragments, prompt variants and
 duplicate deliverables cannot be counted as independent employee outcomes. If otherwise equivalent tasks
 compete, retain the lexicographically smallest task_id; reject the redundant variant. Legitimate different
-deliverables sharing inputs are allowed. Missing context is unknown, never assumed independent.
+deliverables sharing inputs are allowed. A complete related-task catalogue with zero entries means no
+competing candidate was found in the stated scope; it is not missing evidence and does not by itself block
+independence. An incomplete catalogue with no usable comparators can remain unknown. Judge the actual
+task boundary separately; routine tasks can be independently useful even when high_value is failed.
+For chronology ONLY, use not_applicable when this task makes no historical/as-of/timeline claim and has
+no date-dependent acceptance requirement. Do not demand a historical source timestamp for an explicitly
+new, timeless analysis. Historical cutoffs, timeline tasks and temporal checks always require chronology.
+Do not use not_applicable to skip any other readiness gate.
 The deterministic results are observations; they do not replace your substantive assessment.\n"""
 SOLVE_PROMPT = """Perform the specified reconstructed analytical task using only its supplied inputs.
 Produce a substantive deliverable with sections and/or tables. Support factual claims with source refs.

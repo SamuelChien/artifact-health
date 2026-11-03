@@ -97,6 +97,14 @@ class ContractTests(unittest.TestCase):
         self.assertIn('HISTORICAL_CUTOFF_UNKNOWN',assess(task,units,semantic(task))['unknowns'])
         task['temporal_cutoff']='2020-01-01T00:00:00Z'
         self.assertIn('FUTURE_INPUT',assess(task,units,semantic(task))['failures'])
+    def test_timeless_analysis_can_mark_chronology_not_applicable(self):
+        task,units=fixture();review=semantic(task);review['checks']['chronology']['state']='not_applicable'
+        self.assertEqual(assess(task,units,review)['state'],'ready')
+    def test_chronology_cannot_be_waived_for_historical_or_timeline_tasks(self):
+        for kind,family in [('historical_employee_task','reconcile_and_audit'),('reconstructed_analysis','reconstruct_timeline')]:
+            task,units=fixture();task.update(kind=kind,family=family);review=semantic(task)
+            review['checks']['chronology']['state']='not_applicable'
+            self.assertIn('CHRONOLOGY_REQUIRED',assess(task,units,review)['failures'])
 
     def test_checks_are_executed_not_declared(self):
         task,units=fixture();units['j']={**units['i'],'id':'j','text':'{"amount":"wrong"}'}

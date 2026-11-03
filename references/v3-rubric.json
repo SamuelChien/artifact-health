@@ -9,6 +9,8 @@
   "objective_checks": ["numeric_equal", "sum_equal", "difference_equal", "product_equal", "text_equal", "date_order", "json_schema"],
   "numeric_absolute_tolerance_maximum": 0.01,
   "states": ["ready", "not_ready", "unknown"],
+  "chronology_policy": "not_applicable is allowed only for timeless analysis; historical, cutoff, timeline and date-check tasks require chronology",
+  "duplicate_catalogue_policy": "a complete empty catalogue is a scoped zero; it is not missing evidence",
   "business_origins": ["corroborated_business", "declared_simulation", "unknown"],
   "ai_involvement": ["declared_generated", "declared_assisted", "unknown"],
   "task_kinds": ["historical_employee_task", "reconstructed_analysis", "simulation"],

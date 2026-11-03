@@ -266,6 +266,11 @@ def assess(task, units, semantic=None):
             failures.append("SELF_REVIEW")
         for key in ("grounded_need", "input_completeness", "output_correctness", "answer_separation", "native_fidelity", "origin_disclosure", "supported_connections", "chronology", "task_independence"):
             state = semantic.get("checks", {}).get(key, {}).get("state", "unknown")
+            if key=='chronology' and state=='not_applicable':
+                temporal=task['kind']=='historical_employee_task' or bool(cutoff) or task['family']=='reconstruct_timeline' or any(
+                    c.get('kind')=='date_order' for c in task.get('checks',[])+semantic.get('objective_checks',[]))
+                if temporal:failures.append('CHRONOLOGY_REQUIRED')
+                continue
             if state == "failed":
                 failures.append(key.upper())
             elif state != "met":
